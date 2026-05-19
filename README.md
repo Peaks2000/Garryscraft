@@ -1,4 +1,4 @@
-# GarrysCraft
+# GarrysCraft (formerly mcgm)
 
 Experimental Minecraft Java <-> Garry's Mod bridge.
 
