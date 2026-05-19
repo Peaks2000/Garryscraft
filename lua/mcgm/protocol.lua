@@ -237,13 +237,13 @@ function P.readPosition(data, offset)
 
     local unsignedHi = hi < 0 and hi + 0x100000000 or hi
     local unsignedLo = lo < 0 and lo + 0x100000000 or lo
-    local x = math.floor(unsignedHi / 0x40)
-    local z = bit.bor(bit.lshift(bit.band(unsignedHi, 0x3F), 20), bit.rshift(unsignedLo, 12))
-    local y = bit.band(unsignedLo, 0xFFF)
+    local x = bit.rshift(unsignedHi, 6)
+    local y = bit.bor(bit.lshift(bit.band(unsignedHi, 0x3F), 6), bit.rshift(unsignedLo, 26))
+    local z = bit.band(unsignedLo, 0x3FFFFFF)
 
     if x >= 0x2000000 then x = x - 0x4000000 end
-    if z >= 0x2000000 then z = z - 0x4000000 end
     if y >= 0x800 then y = y - 0x1000 end
+    if z >= 0x2000000 then z = z - 0x4000000 end
 
     return { x = x, y = y, z = z }, nextOffset
 end
@@ -273,8 +273,8 @@ function P.writePosition(x, y, z)
     y = band(math.floor(y or 0), 0xFFF)
     z = band(math.floor(z or 0), 0x3FFFFFF)
 
-    local hi = bor(lshift(x, 6), rshift(z, 20))
-    local lo = bor(lshift(band(z, 0xFFFFF), 12), y)
+    local hi = bor(lshift(x, 6), rshift(y, 6))
+    local lo = bor(lshift(band(y, 0x3F), 26), z)
 
     return P.writeInt(hi) .. P.writeInt(lo)
 end

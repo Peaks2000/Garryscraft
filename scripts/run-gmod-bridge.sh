@@ -114,6 +114,10 @@ Minecraft Java clients:
   Version: 1.12.2
   Address: <your-server-ip>:$MC_PORT
 
+GMod block controls:
+  Chat: !block / !breakblock
+  Optional binds: bind b mcgm_block_place; bind n mcgm_block_break
+
 Starting srcds...
 EOF
 

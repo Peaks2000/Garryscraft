@@ -144,11 +144,13 @@ local function spawnMinecraftBlockEnt(x, y, z, state)
 
     local model = C.minecraft_block_model
     if util and util.IsValidModel and not util.IsValidModel(model) then
-        log("configured minecraft_block_model is invalid: " .. tostring(model) .. "; using crate fallback")
-        model = "models/props_junk/wood_crate001a.mdl"
+        log("configured minecraft_block_model is invalid: " .. tostring(model) .. "; using hunter cube fallback")
+        model = "models/hunter/blocks/cube025x025x025.mdl"
     end
 
-    local ent = ents.Create("prop_physics")
+    util.PrecacheModel(model)
+
+    local ent = ents.Create(C.minecraft_block_entity_class or "base_anim")
     if not IsValid(ent) then
         log("failed to create GMod block entity for " .. key)
         return
@@ -158,16 +160,22 @@ local function spawnMinecraftBlockEnt(x, y, z, state)
     ent:SetModel(model)
     ent:SetPos(pos)
     ent:SetAngles(Angle(0, 0, 0))
-    ent:SetColor(Color(145, 145, 145, 255))
+    ent:SetColor(Color(80, 220, 120, 255))
     ent:SetRenderMode(RENDERMODE_NORMAL)
-    ent:SetMaterial("")
+    ent:SetMaterial("models/debug/debugwhite")
     ent.MCGM_BlockKey = key
     ent.MCGM_BlockState = state
     ent:Spawn()
+    ent:PhysicsInitBox(C.minecraft_block_mins or Vector(-16, -16, -16), C.minecraft_block_maxs or Vector(16, 16, 16))
+    ent:SetMoveType(MOVETYPE_NONE)
     ent:SetPos(minecraftBlockToVec(x, y, z))
     ent:SetAngles(Angle(0, 0, 0))
     ent:SetModelScale(C.minecraft_block_scale or 1, 0)
-    ent:SetSolid(C.minecraft_block_solid and SOLID_VPHYSICS or SOLID_NONE)
+    ent:Activate()
+    ent:SetNoDraw(false)
+    ent:DrawShadow(true)
+    ent:SetSolid(C.minecraft_block_solid and SOLID_BBOX or SOLID_NONE)
+    ent:SetCollisionBounds(C.minecraft_block_mins or Vector(-16, -16, -16), C.minecraft_block_maxs or Vector(16, 16, 16))
     ent:SetCollisionGroup(COLLISION_GROUP_NONE)
 
     local phys = ent:GetPhysicsObject()
@@ -452,6 +460,14 @@ local function broadcastBlockChange(x, y, z, state)
     end
 end
 
+local function resendSpawnChunksToMinecraft()
+    for _, client in pairs(clients) do
+        if client.state == STATE_PLAY then
+            sendSpawnChunks(client)
+        end
+    end
+end
+
 local function setWorldBlock(x, y, z, state, persist)
     x = math.floor(x)
     y = math.floor(y)
@@ -473,8 +489,64 @@ local function setWorldBlock(x, y, z, state, persist)
     broadcastBlockChange(x, y, z, state)
 end
 
+local function gmodTraceForBlock(ply)
+    if not IsValid(ply) then return nil end
+
+    return util.TraceLine({
+        start = ply:GetShootPos(),
+        endpos = ply:GetShootPos() + ply:GetAimVector() * (C.gmod_block_place_range or 512),
+        filter = ply,
+        mask = MASK_SOLID
+    })
+end
+
+local function gmodPlaceBridgeBlock(ply)
+    local tr = gmodTraceForBlock(ply)
+    if not tr then return false end
+
+    local pos
+    if tr.Hit then
+        pos = vecToMinecraft(tr.HitPos + tr.HitNormal * (C.world_scale * 1.05))
+    else
+        pos = vecToMinecraft(ply:GetShootPos() + ply:GetAimVector() * 128)
+    end
+
+    local x = math.floor(pos.x)
+    local y = math.floor(pos.y)
+    local z = math.floor(pos.z)
+    setWorldBlock(x, y, z, C.minecraft_build_block_state, true)
+    resendSpawnChunksToMinecraft()
+    broadcastBlockChange(x, y, z, C.minecraft_build_block_state)
+    log((IsValid(ply) and ply:Nick() or "Console") .. " placed bridge block at " .. x .. "," .. y .. "," .. z)
+    return true
+end
+
+local function gmodBreakBridgeBlock(ply)
+    local tr = gmodTraceForBlock(ply)
+    if not tr then return false end
+
+    local key
+    if tr.Hit and IsValid(tr.Entity) and tr.Entity.MCGM_BlockKey then
+        key = tr.Entity.MCGM_BlockKey
+    elseif tr.Hit then
+        local pos = vecToMinecraft(tr.HitPos - tr.HitNormal * 2)
+        key = blockKey(pos.x, pos.y, pos.z)
+    end
+
+    if not key or not worldBlocks[key] then return false end
+
+    local x, y, z = parseBlockKey(key)
+    if not x or not y or not z then return false end
+
+    setWorldBlock(x, y, z, 0, true)
+    broadcastBlockChange(x, y, z, 0)
+    log((IsValid(ply) and ply:Nick() or "Console") .. " broke bridge block at " .. x .. "," .. y .. "," .. z)
+    return true
+end
+
 local function replayWorldBlocks(client, quiet, limit)
     local count = 0
+    if limit and limit <= 0 then limit = nil end
     for key, state in pairs(worldBlocks) do
         local x, y, z = parseBlockKey(key)
         if x and y and z then
@@ -850,7 +922,7 @@ local function samplePlatformBlock(blockX, blockZ)
     return 0
 end
 
-local function buildChunkSection(chunkX, chunkZ)
+local function buildChunkSection(chunkX, chunkZ, sectionY)
     local bitsPerBlock = 4
     local longCount = 256
     local longs = {}
@@ -874,9 +946,10 @@ local function buildChunkSection(chunkX, chunkZ)
                 local blockIndex = y * 256 + z * 16 + x
                 local blockX = chunkX * 16 + x
                 local blockZ = chunkZ * 16 + z
+                local globalY = sectionY * 16 + y
                 local state = 0
 
-                if y == C.floor_y % 16 then
+                if globalY == C.floor_y then
                     state = samplePlatformBlock(blockX, blockZ) ~= 0 and 1 or 0
                 end
 
@@ -908,8 +981,17 @@ end
 
 local function sendPlatformChunk(client, chunkX, chunkZ)
     local biomeData = string.rep("\127", 256)
-    local primaryBitMask = bit.lshift(1, math.floor(C.floor_y / 16))
-    local chunkData = buildChunkSection(chunkX, chunkZ) .. biomeData
+    local floorSection = math.floor(C.floor_y / 16)
+    local radius = C.chunk_section_radius or 1
+    local primaryBitMask = 0
+    local sections = {}
+
+    for sectionY = math.max(0, floorSection - radius), math.min(15, floorSection + radius) do
+        primaryBitMask = bit.bor(primaryBitMask, bit.lshift(1, sectionY))
+        sections[#sections + 1] = buildChunkSection(chunkX, chunkZ, sectionY)
+    end
+
+    local chunkData = table.concat(sections) .. biomeData
 
     sendPacket(client, 0x20,
         P.writeInt(chunkX) ..
@@ -1025,6 +1107,7 @@ local function sendGmodPlayerSpawn(client, ply)
     if not IsValid(ply) then return end
 
     local pos = vecToMinecraft(ply:GetPos())
+    pos.y = pos.y + (C.gmod_player_minecraft_y_offset or 0)
     local angles = ply:EyeAngles()
     local yaw = minecraftAngle(angles.y)
     local pitch = minecraftAngle(angles.p)
@@ -1146,6 +1229,7 @@ local function sendGmodPlayerTeleport(client, ply)
     if not IsValid(ply) then return end
 
     local pos = vecToMinecraft(ply:GetPos())
+    pos.y = pos.y + (C.gmod_player_minecraft_y_offset or 0)
     local yaw = minecraftAngle(ply:EyeAngles().y)
     local pitch = minecraftAngle(ply:EyeAngles().p)
 
@@ -1702,6 +1786,19 @@ function MC_GM.Start()
 
     hook.Add("PlayerSay", "MCGM_GmodChatToMinecraft", function(ply, text, teamChat)
         if teamChat then return end
+        local command = string.lower(string.Trim(text or ""))
+        if command == "!block" or command == "/block" then
+            if gmodPlaceBridgeBlock(ply) then
+                PrintMessage(HUD_PRINTTALK, "[MCGM] " .. ply:Nick() .. " placed a bridge block")
+            end
+            return ""
+        end
+        if command == "!breakblock" or command == "/breakblock" then
+            if gmodBreakBridgeBlock(ply) then
+                PrintMessage(HUD_PRINTTALK, "[MCGM] " .. ply:Nick() .. " broke a bridge block")
+            end
+            return ""
+        end
         broadcastChat("[GMod] <" .. ply:Nick() .. "> " .. text)
     end)
 
@@ -1743,6 +1840,27 @@ function MC_GM.Start()
         if IsValid(ply) and not ply:IsAdmin() then return end
         saveWorldStorage()
         log("saved " .. table.Count(worldBlocks) .. " Minecraft bridge blocks")
+    end)
+
+    concommand.Add("mcgm_block_place", function(ply)
+        if IsValid(ply) and not ply:Alive() then return end
+        if not gmodPlaceBridgeBlock(ply) then
+            log("could not place bridge block")
+        end
+    end)
+
+    concommand.Add("mcgm_block_break", function(ply)
+        if IsValid(ply) and not ply:Alive() then return end
+        if not gmodBreakBridgeBlock(ply) then
+            log("no bridge block in crosshair")
+        end
+    end)
+
+    concommand.Add("mcgm_block_test_visible", function(ply)
+        if not IsValid(ply) then return end
+        local pos = vecToMinecraft(ply:GetShootPos() + ply:GetAimVector() * 96)
+        setWorldBlock(pos.x, pos.y, pos.z, C.minecraft_build_block_state, true)
+        log("spawned test visible bridge block in front of " .. ply:Nick())
     end)
 
     concommand.Add("mcgm_rebuild_blocks", function(ply)
@@ -1837,6 +1955,9 @@ function MC_GM.Stop()
     hook.Remove("PlayerDisconnected", "MCGM_RemoveGmodPlayerFromMinecraft")
     concommand.Remove("mcgm_spawn_bridge")
     concommand.Remove("mcgm_world_save")
+    concommand.Remove("mcgm_block_place")
+    concommand.Remove("mcgm_block_break")
+    concommand.Remove("mcgm_block_test_visible")
     concommand.Remove("mcgm_rebuild_blocks")
     concommand.Remove("mcgm_test_block")
     hook.Remove("EntityFireBullets", "MCGM_GmodBulletsHitMinecraft")
