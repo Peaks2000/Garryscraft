@@ -6,6 +6,9 @@ The authority lives in the GMod server. Minecraft clients connect directly to a
 TCP listener hosted by the addon, using Minecraft offline mode, so no Microsoft
 authentication is performed.
 
+##Bugs and quirks
+-Garry's Mod player must be online for Minecraft players to join
+
 ## What works in this prototype
 
 - Minecraft Java 1.12.2 offline-mode handshake/login path.
