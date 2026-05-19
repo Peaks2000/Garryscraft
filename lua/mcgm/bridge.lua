@@ -8,6 +8,8 @@ local server
 local clients = {}
 local proxyOwners = {}
 local sharedPlatform = {}
+local worldBlocks = {}
+local minecraftBlockEnts = {}
 local nextEntityId = 9000
 local lastPosSync = 0
 local lastPropScan = 0
@@ -18,12 +20,74 @@ local STATE_STATUS = 1
 local STATE_LOGIN = 2
 local STATE_PLAY = 3
 
+local ITEM_BOW = 261
+local ITEM_ARROW = 262
+local ITEM_IRON_SWORD = 267
+
 local sendPacket
 local sendChat
 local broadcastChat
+local chatJson
+local isSharedPlatform
+local sendBridgeArenaBlocks
+local sendSpawnChunks
+local distanceToSegment
 
 local function log(msg)
     MsgC(Color(90, 200, 255), "[MCGM] ", color_white, tostring(msg), "\n")
+end
+
+local function blockKey(x, y, z)
+    return tostring(math.floor(x)) .. "," .. tostring(math.floor(y)) .. "," .. tostring(math.floor(z))
+end
+
+local function parseBlockKey(key)
+    local x, y, z = string.match(key, "^(-?%d+),(-?%d+),(-?%d+)$")
+    return tonumber(x), tonumber(y), tonumber(z)
+end
+
+local function ensureWorldStorage()
+    if not file or not util then return end
+    if not file.Exists("mcgm", "DATA") then
+        file.CreateDir("mcgm")
+    end
+    if not file.Exists(MC_GM.WorldPath, "DATA") then
+        local fresh = {
+            version = C.world_version,
+            created_at = os.time(),
+            seed = math.random(1, 2147483647),
+            blocks = {}
+        }
+        file.Write(MC_GM.WorldPath, util.TableToJSON(fresh, true))
+        log("created fresh Minecraft bridge world at data/" .. MC_GM.WorldPath)
+    end
+end
+
+local function loadWorldStorage()
+    ensureWorldStorage()
+    if not file or not util or not file.Exists(MC_GM.WorldPath, "DATA") then return end
+
+    local raw = file.Read(MC_GM.WorldPath, "DATA")
+    local decoded = raw and util.JSONToTable(raw) or nil
+    if not decoded or type(decoded.blocks) ~= "table" then
+        log("world storage was missing or invalid; recreating from scratch")
+        file.Delete(MC_GM.WorldPath)
+        ensureWorldStorage()
+        decoded = util.JSONToTable(file.Read(MC_GM.WorldPath, "DATA") or "")
+    end
+
+    worldBlocks = decoded and decoded.blocks or {}
+    log("loaded " .. table.Count(worldBlocks) .. " stored Minecraft blocks")
+end
+
+local function saveWorldStorage()
+    ensureWorldStorage()
+    if not file or not util then return end
+    file.Write(MC_GM.WorldPath, util.TableToJSON({
+        version = C.world_version,
+        saved_at = os.time(),
+        blocks = worldBlocks
+    }, true))
 end
 
 local function vecToMinecraft(vec)
@@ -48,26 +112,147 @@ local function minecraftToVec(pos)
     )
 end
 
+local function minecraftLookVector(yaw, pitch)
+    yaw = math.rad(tonumber(yaw) or 0)
+    pitch = math.rad(tonumber(pitch) or 0)
+
+    local mcX = -math.cos(pitch) * math.sin(yaw)
+    local mcY = -math.sin(pitch)
+    local mcZ = math.cos(pitch) * math.cos(yaw)
+
+    return Vector(mcX, mcZ, mcY):GetNormalized()
+end
+
+local function minecraftBlockToVec(x, y, z)
+    return minecraftToVec({ x = x + 0.5, y = y + 0.5, z = z + 0.5 })
+end
+
+local function removeMinecraftBlockEnt(key)
+    if IsValid(minecraftBlockEnts[key]) then
+        minecraftBlockEnts[key]:Remove()
+    end
+    minecraftBlockEnts[key] = nil
+end
+
+local function spawnMinecraftBlockEnt(x, y, z, state)
+    if not C.enable_minecraft_block_building or state == 0 then return end
+
+    local key = blockKey(x, y, z)
+    removeMinecraftBlockEnt(key)
+
+    local model = C.minecraft_block_model
+    if util and util.IsValidModel and not util.IsValidModel(model) then
+        log("configured minecraft_block_model is invalid: " .. tostring(model) .. "; using crate fallback")
+        model = "models/props_junk/wood_crate001a.mdl"
+    end
+
+    local ent = ents.Create("prop_physics")
+    if not IsValid(ent) then
+        log("failed to create GMod block entity for " .. key)
+        return
+    end
+
+    local pos = minecraftBlockToVec(x, y, z)
+    ent:SetModel(model)
+    ent:SetPos(pos)
+    ent:SetAngles(Angle(0, 0, 0))
+    ent:SetColor(Color(145, 145, 145, 255))
+    ent:SetRenderMode(RENDERMODE_NORMAL)
+    ent:SetMaterial("")
+    ent.MCGM_BlockKey = key
+    ent.MCGM_BlockState = state
+    ent:Spawn()
+    ent:SetPos(minecraftBlockToVec(x, y, z))
+    ent:SetAngles(Angle(0, 0, 0))
+    ent:SetModelScale(C.minecraft_block_scale or 1, 0)
+    ent:SetSolid(C.minecraft_block_solid and SOLID_VPHYSICS or SOLID_NONE)
+    ent:SetCollisionGroup(COLLISION_GROUP_NONE)
+
+    local phys = ent:GetPhysicsObject()
+    if IsValid(phys) then
+        phys:EnableMotion(false)
+    end
+
+    minecraftBlockEnts[key] = ent
+
+    if C.debug_gmod_block_spawns then
+        log("spawned GMod block " .. key .. " at " .. tostring(pos) .. " model=" .. tostring(model))
+    end
+end
+
+local function rebuildMinecraftBlockEnts()
+    for key, ent in pairs(minecraftBlockEnts) do
+        if IsValid(ent) then ent:Remove() end
+        minecraftBlockEnts[key] = nil
+    end
+
+    for key, state in pairs(worldBlocks) do
+        local x, y, z = parseBlockKey(key)
+        local isBaseFloor = y == C.floor_y and state == C.floor_block_state
+        if x and y and z and state ~= 0 and not isBaseFloor then
+            spawnMinecraftBlockEnt(x, y, z, state)
+        end
+    end
+end
+
 local function updateMinecraftProxy(client)
     if not C.enable_minecraft_player_proxies or not client.gmodPos then return end
 
     if not IsValid(client.proxyEnt) then
-        local ent = ents.Create("prop_dynamic")
+        local ent = ents.Create(C.minecraft_proxy_entity_class or "prop_dynamic")
         if not IsValid(ent) then return end
 
         ent:SetModel(C.minecraft_proxy_model)
+        ent:SetPos(client.gmodPos)
+        ent:SetAngles(Angle(0, -(client.yaw or 0), 0))
+        ent:Spawn()
         ent:SetMoveType(MOVETYPE_NONE)
         ent:SetSolid(SOLID_BBOX)
-        ent:SetCollisionBounds(Vector(-16, -16, 0), Vector(16, 16, 72))
+        ent:SetCollisionBounds(C.minecraft_proxy_mins or Vector(-16, -16, 0), C.minecraft_proxy_maxs or Vector(16, 16, 72))
         ent:SetCollisionGroup(COLLISION_GROUP_PLAYER)
-        ent:Spawn()
+        ent:SetColor(Color(80, 180, 255))
         ent:SetName("mcgm_" .. tostring(client.username or client.entityId))
+        ent:SetNWBool("MCGM_MinecraftProxy", C.enable_minecraft_nametags)
+        ent:SetNWString("MCGM_Name", "[MC] " .. tostring(client.username or "Minecraft"))
+        if ent.LookupSequence and ent.ResetSequence then
+            local seq = ent:LookupSequence("idle_all_01")
+            if seq and seq >= 0 then
+                ent:ResetSequence(seq)
+            end
+        end
+        local phys = ent:GetPhysicsObject()
+        if IsValid(phys) then
+            phys:EnableMotion(false)
+        end
         client.proxyEnt = ent
         proxyOwners[ent] = client
     end
 
     client.proxyEnt:SetPos(client.gmodPos)
     client.proxyEnt:SetAngles(Angle(0, -(client.yaw or 0), 0))
+    client.proxyEnt:SetCollisionBounds(C.minecraft_proxy_mins or Vector(-16, -16, 0), C.minecraft_proxy_maxs or Vector(16, 16, 72))
+    client.proxyEnt:SetNWBool("MCGM_MinecraftProxy", C.enable_minecraft_nametags)
+    client.proxyEnt:SetNWString("MCGM_Name", "[MC] " .. tostring(client.username or "Minecraft"))
+    local phys = client.proxyEnt:GetPhysicsObject()
+    if IsValid(phys) then
+        phys:SetPos(client.gmodPos)
+        phys:SetAngles(Angle(0, -(client.yaw or 0), 0))
+        phys:EnableMotion(false)
+        phys:Wake()
+    end
+
+    if C.debug_minecraft_movement and (not client.nextMoveLog or CurTime() >= client.nextMoveLog) then
+        client.nextMoveLog = CurTime() + 1
+        log((client.username or "MC") .. " proxy at " .. tostring(client.gmodPos))
+    end
+end
+
+local function setMinecraftClientPosition(client, x, y, z, yaw, pitch)
+    client.mcPos = { x = x or 0, y = y or 0, z = z or 0 }
+    if yaw then client.yaw = yaw end
+    if pitch then client.pitch = pitch end
+    client.gmodPos = minecraftToVec(client.mcPos)
+    updateMinecraftProxy(client)
 end
 
 local function removeMinecraftProxy(client)
@@ -78,6 +263,46 @@ local function removeMinecraftProxy(client)
     client.proxyEnt = nil
 end
 
+local function sendSetSlot(client, slot, itemId, count, damage)
+    sendPacket(client, 0x16,
+        string.char(0) ..
+        P.writeShort(slot) ..
+        P.writeSlot(itemId, count or 1, damage or 0)
+    )
+end
+
+local function sendMinecraftCombatHotbar(client)
+    sendSetSlot(client, 36, ITEM_IRON_SWORD, 1, 0)
+    sendSetSlot(client, 37, ITEM_BOW, 1, 0)
+    sendSetSlot(client, 38, ITEM_ARROW, 64, 0)
+end
+
+local function sendMinecraftGameMode(client, mode)
+    sendPacket(client, 0x1E,
+        string.char(3) ..
+        P.writeFloat(mode or 1)
+    )
+end
+
+local function sendMinecraftAbilities(client, creative)
+    sendPacket(client, 0x2C,
+        string.char(creative and 0x0D or 0) ..
+        P.writeFloat(0.05) ..
+        P.writeFloat(0.1)
+    )
+end
+
+local function sendMinecraftMaxHealth(client)
+    local maxHealth = tonumber(C.minecraft_proxy_health) or 100
+    sendPacket(client, 0x4E,
+        P.writeVarInt(client.entityId) ..
+        P.writeInt(1) ..
+        P.writeString("generic.maxHealth") ..
+        P.writeDouble(maxHealth) ..
+        P.writeVarInt(0)
+    )
+end
+
 local function sendMinecraftHealth(client)
     sendPacket(client, 0x41,
         P.writeFloat(client.mcHealth or C.minecraft_proxy_health) ..
@@ -86,30 +311,76 @@ local function sendMinecraftHealth(client)
     )
 end
 
-local function damageMinecraftClient(client, amount, attackerName)
+local function respawnMinecraftClient(client)
     if not client or client.state ~= STATE_PLAY then return end
+
+    local spawn = C.minecraft_spawn
+    log("respawning Minecraft client " .. tostring(client.username or client.entityId))
+
+    client.deadInMinecraft = false
+    client.mcHealth = C.minecraft_proxy_health
+    client.mcPos = table.Copy(spawn)
+    client.gmodPos = minecraftToVec(client.mcPos)
+    updateMinecraftProxy(client)
+
+    -- Vanilla 1.12 clients need a dimension change before respawning back into
+    -- the same dimension, otherwise the respawn screen can get stuck.
+    sendPacket(client, 0x35,
+        P.writeInt(-1) ..
+        string.char(1) ..
+        string.char(1) ..
+        P.writeString("flat")
+    )
+    sendPacket(client, 0x35,
+        P.writeInt(0) ..
+        string.char(1) ..
+        string.char(1) ..
+        P.writeString("flat")
+    )
+    if C.send_chunks_on_login then
+        sendSpawnChunks(client)
+    end
+    sendMinecraftGameMode(client, 1)
+    sendMinecraftAbilities(client, true)
+    sendMinecraftMaxHealth(client)
+    sendMinecraftHealth(client)
+    sendMinecraftCombatHotbar(client)
+    sendPacket(client, 0x2F,
+        P.writeDouble(spawn.x + 0.5) ..
+        P.writeDouble(spawn.y) ..
+        P.writeDouble(spawn.z + 0.5) ..
+        P.writeFloat(0) ..
+        P.writeFloat(0) ..
+        string.char(0) ..
+        P.writeVarInt(math.floor(CurTime() * 1000) % 2147483647)
+    )
+end
+
+local function killMinecraftClient(client, attackerName)
+    if not client or client.deadInMinecraft then return end
+
+    client.deadInMinecraft = true
+    client.mcHealth = 0
+    sendMinecraftGameMode(client, 0)
+    sendMinecraftAbilities(client, false)
+    sendMinecraftHealth(client)
+    sendPacket(client, 0x2D,
+        P.writeVarInt(2) ..
+        P.writeVarInt(client.entityId) ..
+        P.writeInt(client.entityId) ..
+        chatJson(tostring(attackerName or "GMod") .. " killed " .. tostring(client.username or "Minecraft"))
+    )
+end
+
+local function damageMinecraftClient(client, amount, attackerName)
+    if not client or client.state ~= STATE_PLAY or client.deadInMinecraft then return end
 
     client.mcHealth = math.max(0, (client.mcHealth or C.minecraft_proxy_health) - amount)
     sendMinecraftHealth(client)
-    sendChat(client, "Ouch: " .. tostring(attackerName or "GMod") .. " hit you for " .. amount)
+    sendSystemChat(client, "Ouch: " .. tostring(attackerName or "GMod") .. " hit you for " .. amount)
 
     if client.mcHealth <= 0 then
-        local spawn = C.minecraft_spawn
-        client.mcHealth = C.minecraft_proxy_health
-        client.mcPos = table.Copy(spawn)
-        client.gmodPos = minecraftToVec(client.mcPos)
-        updateMinecraftProxy(client)
-        sendMinecraftHealth(client)
-        sendPacket(client, 0x2F,
-            P.writeDouble(spawn.x + 0.5) ..
-            P.writeDouble(spawn.y) ..
-            P.writeDouble(spawn.z + 0.5) ..
-            P.writeFloat(0) ..
-            P.writeFloat(0) ..
-            string.char(0) ..
-            P.writeVarInt(math.floor(CurTime() * 1000) % 2147483647)
-        )
-        broadcastChat(client.username .. " was bonked back to spawn")
+        killMinecraftClient(client, attackerName)
     end
 end
 
@@ -117,10 +388,27 @@ sendPacket = function(client, packetId, payload)
     if not client or not client.sock then return end
 
     local bytes = P.packet(packetId, payload)
-    local ok, err = client.sock:send(bytes)
-    if not ok and err ~= "timeout" then
-        client.dead = true
+    client.outBuffer = (client.outBuffer or "") .. bytes
+end
+
+local function flushClientOutput(client)
+    if not client.outBuffer or client.outBuffer == "" then return end
+
+    local sent, err, partial = client.sock:send(client.outBuffer)
+    if sent then
+        client.outBuffer = string.sub(client.outBuffer, sent + 1)
+        return
     end
+
+    if err == "timeout" then
+        local sentBytes = tonumber(partial) or 0
+        if sentBytes > 0 then
+            client.outBuffer = string.sub(client.outBuffer, sentBytes + 1)
+        end
+        return
+    end
+
+    client.dead = true
 end
 
 local function broadcastPacket(packetId, payload)
@@ -146,17 +434,61 @@ local function broadcastBlockChange(x, y, z, state)
     end
 end
 
+local function setWorldBlock(x, y, z, state, persist)
+    x = math.floor(x)
+    y = math.floor(y)
+    z = math.floor(z)
+    state = tonumber(state) or 0
+
+    if persist then
+        local key = blockKey(x, y, z)
+        if state == 0 then
+            worldBlocks[key] = nil
+            removeMinecraftBlockEnt(key)
+        else
+            worldBlocks[key] = state
+            spawnMinecraftBlockEnt(x, y, z, state)
+        end
+        saveWorldStorage()
+    end
+
+    broadcastBlockChange(x, y, z, state)
+end
+
+local function replayWorldBlocks(client, quiet, limit)
+    local count = 0
+    for key, state in pairs(worldBlocks) do
+        local x, y, z = parseBlockKey(key)
+        if x and y and z then
+            sendBlockChange(client, x, y, z, state)
+            count = count + 1
+            if limit and count >= limit then break end
+        end
+    end
+    if not quiet then
+        sendSystemChat(client, "Loaded " .. count .. " stored bridge blocks.")
+    end
+end
+
 local function chatPayload(text, position)
     local json = "{\"text\":\"" .. P.jsonString(text) .. "\"}"
     return P.writeString(json) .. string.char(position or 0)
 end
 
-local function chatJson(text)
+chatJson = function(text)
     return P.writeString("{\"text\":\"" .. P.jsonString(text) .. "\"}")
 end
 
 sendChat = function(client, text)
     sendPacket(client, 0x0F, chatPayload(text, 0))
+end
+
+local function sendSystemChat(client, text)
+    if C.quiet_minecraft_system_chat then
+        log("MC system chat suppressed: " .. tostring(text))
+        return
+    end
+    sendChat(client, text)
 end
 
 broadcastChat = function(text)
@@ -254,16 +586,52 @@ local function damageGmodPlayerFromMinecraft(client, ply, amount, force)
     return true
 end
 
+local function selectedMinecraftDamage(client)
+    if client.selectedHotbarSlot == 1 then
+        return C.minecraft_bow_damage, C.minecraft_blast_force
+    end
+
+    return C.minecraft_sword_damage or C.minecraft_crowbar_damage, 350
+end
+
+local function fireMinecraftBow(client)
+    if not client or not client.gmodPos or client.deadInMinecraft then return false end
+
+    local startPos = client.gmodPos + Vector(0, 0, 56)
+    local dir = minecraftLookVector(client.yaw or 0, client.pitch or 0)
+    local endPos = startPos + dir * (C.minecraft_command_range or 512)
+    local bestTarget
+    local bestDist = 48
+
+    for _, ply in ipairs(player.GetAll()) do
+        if IsValid(ply) and ply:Alive() then
+            local dist = distanceToSegment(ply:WorldSpaceCenter(), startPos, endPos)
+            if dist < bestDist then
+                bestDist = dist
+                bestTarget = ply
+            end
+        end
+    end
+
+    if IsValid(bestTarget) then
+        damageGmodPlayerFromMinecraft(client, bestTarget, C.minecraft_bow_damage, C.minecraft_blast_force)
+        PrintMessage(HUD_PRINTTALK, "[MC] " .. client.username .. " shot " .. bestTarget:Nick())
+        return true
+    end
+
+    return false
+end
+
 local function minecraftCommand(client, message)
     local command = string.lower(string.Trim(message or ""))
 
     if command == "/crowbar" then
         local target = nearestGmodPlayer(client, C.minecraft_command_range)
         if damageGmodPlayerFromMinecraft(client, target, C.minecraft_crowbar_damage, 250) then
-            sendChat(client, "Crowbar hit " .. target:Nick())
+            sendSystemChat(client, "Crowbar hit " .. target:Nick())
             PrintMessage(HUD_PRINTTALK, "[MC] " .. client.username .. " crowbarred " .. target:Nick())
         else
-            sendChat(client, "No GMod player close enough to crowbar.")
+            sendSystemChat(client, "No GMod player close enough to crowbar.")
         end
         return true
     end
@@ -280,34 +648,74 @@ local function minecraftCommand(client, message)
         if client.gmodPos then
             for _, ent in ipairs(ents.FindInSphere(client.gmodPos, C.minecraft_command_range * 0.75)) do
                 local phys = IsValid(ent) and ent:GetPhysicsObject()
-                if IsValid(phys) then
+                if IsValid(phys) and not isSharedPlatform(ent) then
                     phys:ApplyForceCenter((ent:GetPos() - client.gmodPos):GetNormalized() * C.minecraft_blast_force * phys:GetMass())
                     hit = true
                 end
             end
         end
 
-        sendChat(client, hit and "Blast fired into GMod." or "Blast fizzled. Nothing nearby.")
+        sendSystemChat(client, hit and "Blast fired into GMod." or "Blast fizzled. Nothing nearby.")
         PrintMessage(HUD_PRINTTALK, "[MC] " .. client.username .. " used /blast")
         return true
     end
 
     if command == "/where" then
         if client.gmodPos then
-            sendChat(client, "GMod proxy at " .. tostring(client.gmodPos))
+            sendSystemChat(client, "GMod proxy at " .. tostring(client.gmodPos))
         else
-            sendChat(client, "No proxy position yet.")
+            sendSystemChat(client, "No proxy position yet.")
         end
         return true
     end
 
+    if command == "/proxy" then
+        if client.mcPos then
+            setMinecraftClientPosition(client, client.mcPos.x, client.mcPos.y, client.mcPos.z, client.yaw, client.pitch)
+            sendSystemChat(client, "Proxy refreshed.")
+        end
+        return true
+    end
+
+    if command == "/break" then
+        if client.mcPos then
+            local x = math.floor(client.mcPos.x)
+            local y = math.floor(client.mcPos.y - 1)
+            local z = math.floor(client.mcPos.z)
+            setWorldBlock(x, y, z, 0, true)
+            sendBlockChange(client, x, y, z, 0)
+            sendSystemChat(client, "Removed block under you.")
+            log((client.username or "MC") .. " used /break at " .. x .. "," .. y .. "," .. z)
+        end
+        return true
+    end
+
+    if command == "/debugblocks" then
+        sendSystemChat(client, "Stored blocks: " .. table.Count(worldBlocks) .. ", GMod block ents: " .. table.Count(minecraftBlockEnts))
+        return true
+    end
+
+    if command == "/rebuildblocks" then
+        rebuildMinecraftBlockEnts()
+        sendSystemChat(client, "Rebuilt GMod block ents: " .. table.Count(minecraftBlockEnts))
+        return true
+    end
+
+    if command == "/testblock" then
+        setWorldBlock(C.minecraft_spawn.x, C.minecraft_spawn.y, C.minecraft_spawn.z, C.minecraft_build_block_state, true)
+        sendSystemChat(client, "Spawned a test GMod block at bridge origin.")
+        return true
+    end
+
     if command == "/sync" then
-        sendBridgeArenaBlocks(client)
+        if sendBridgeArenaBlocks then
+            sendBridgeArenaBlocks(client)
+        end
         return true
     end
 
     if command == "/help" then
-        sendChat(client, "Bridge commands: /crowbar, /blast, /where, /sync")
+        sendChat(client, "Bridge commands: /crowbar, /blast, /where, /proxy, /sync, /break, /debugblocks, /rebuildblocks, /testblock")
         return true
     end
 
@@ -354,7 +762,7 @@ local function createSharedPlatform()
             local ent = ents.Create("prop_physics")
             if IsValid(ent) then
                 ent:SetModel(C.shared_platform_model)
-                ent:SetPos(C.gmod_origin + Vector(x * tileSize, y * tileSize, -8))
+                ent:SetPos(C.gmod_origin + Vector(x * tileSize, y * tileSize, C.shared_platform_z or 0))
                 ent:SetAngles(Angle(0, 0, 0))
                 ent:Spawn()
                 ent:SetSolid(SOLID_VPHYSICS)
@@ -376,6 +784,17 @@ local function removeSharedPlatform()
         if IsValid(ent) then ent:Remove() end
     end
     sharedPlatform = {}
+end
+
+isSharedPlatform = function(ent)
+    for _, platformEnt in ipairs(sharedPlatform) do
+        if platformEnt == ent then return true end
+    end
+    return false
+end
+
+local function isProtectedBridgeEntity(ent)
+    return IsValid(ent) and (isSharedPlatform(ent) or ent.MCGM_BlockKey ~= nil)
 end
 
 local function samplePlatformBlock(blockX, blockZ)
@@ -478,7 +897,7 @@ local function sendPlatformChunk(client, chunkX, chunkZ)
     )
 end
 
-local function sendSpawnChunks(client)
+sendSpawnChunks = function(client)
     local spawn = C.minecraft_spawn
     local chunkX = math.floor(spawn.x / 16)
     local chunkZ = math.floor(spawn.z / 16)
@@ -506,7 +925,7 @@ local function sendAabbBlocks(client, mins, maxs, state, limit)
         for y = minY, maxY do
             for z = minZ, maxZ do
                 local edge = x == minX or x == maxX or y == minY or y == maxY or z == minZ or z == maxZ
-                if edge then
+                if C.hitbox_fill_blocks or edge then
                     sendBlockChange(client, x, y, z, state)
                     count = count + 1
                     if count >= limit then return count end
@@ -518,9 +937,37 @@ local function sendAabbBlocks(client, mins, maxs, state, limit)
     return count
 end
 
-local function sendBridgeArenaBlocks(client)
+local function ensureBasePlatformBlocks()
+    if not C.enable_persistent_platform_blocks then return end
+
+    local radius = C.spawn_platform_radius
+    local added = 0
+
+    for x = C.minecraft_spawn.x - radius, C.minecraft_spawn.x + radius do
+        for z = C.minecraft_spawn.z - radius, C.minecraft_spawn.z + radius do
+            local dx = x - C.minecraft_spawn.x
+            local dz = z - C.minecraft_spawn.z
+            if dx * dx + dz * dz <= radius * radius then
+                local key = blockKey(x, C.floor_y, z)
+                if worldBlocks[key] ~= C.floor_block_state then
+                    worldBlocks[key] = C.floor_block_state
+                    added = added + 1
+                end
+            end
+        end
+    end
+
+    if added > 0 then
+        saveWorldStorage()
+        log("created " .. added .. " persistent platform blocks")
+    end
+end
+
+sendBridgeArenaBlocks = function(client)
     local radius = C.spawn_platform_radius
     local sent = 0
+
+    ensureBasePlatformBlocks()
 
     for x = C.minecraft_spawn.x - radius, C.minecraft_spawn.x + radius do
         for z = C.minecraft_spawn.z - radius, C.minecraft_spawn.z + radius do
@@ -533,6 +980,8 @@ local function sendBridgeArenaBlocks(client)
         end
     end
 
+    replayWorldBlocks(client, false, C.max_initial_block_replay)
+
     for _, ent in ipairs(sharedPlatform) do
         if IsValid(ent) then
             local mins, maxs = ent:WorldSpaceAABB()
@@ -540,7 +989,7 @@ local function sendBridgeArenaBlocks(client)
         end
     end
 
-    sendChat(client, "Bridge arena synced: " .. sent .. " platform blocks.")
+    sendSystemChat(client, "Bridge arena synced: " .. sent .. " platform blocks.")
 end
 
 local function minecraftAngle(degrees)
@@ -569,6 +1018,63 @@ local function sendGmodPlayerSpawn(client, ply)
     )
 end
 
+local function weaponClassToMinecraftItem(class)
+    class = string.lower(tostring(class or ""))
+    if class == "" then return -1 end
+    if class == "weapon_crowbar" then return ITEM_IRON_SWORD end
+
+    if class == "weapon_physgun" or
+        class == "weapon_physcannon" or
+        class == "gmod_tool" or
+        class == "gmod_camera" or
+        class == "weapon_fists" then
+        return -1
+    end
+
+    if string.find(class, "pistol", 1, true) or
+        string.find(class, "smg", 1, true) or
+        string.find(class, "ar2", 1, true) or
+        string.find(class, "shotgun", 1, true) or
+        string.find(class, "crossbow", 1, true) or
+        string.find(class, "rpg", 1, true) or
+        string.find(class, "rifle", 1, true) or
+        string.find(class, "gun", 1, true) then
+        return ITEM_BOW
+    end
+
+    if string.sub(class, 1, 7) == "weapon_" then
+        return ITEM_BOW
+    end
+
+    return -1
+end
+
+local function getGmodPlayerEquipmentItem(ply)
+    if not IsValid(ply) then return -1 end
+
+    local weapon = ply:GetActiveWeapon()
+    if not IsValid(weapon) then return -1 end
+
+    return weaponClassToMinecraftItem(weapon:GetClass())
+end
+
+local function sendGmodPlayerEquipment(client, ply, force)
+    if not C.enable_gmod_equipment_sync or not IsValid(ply) then return end
+
+    client.gmodEquipment = client.gmodEquipment or {}
+
+    local entityId = ply:EntIndex()
+    local itemId = getGmodPlayerEquipmentItem(ply)
+    if not force and client.gmodEquipment[entityId] == itemId then return end
+
+    client.gmodEquipment[entityId] = itemId
+    sendPacket(client, 0x3F,
+        P.writeVarInt(entityId) ..
+        P.writeVarInt(0) ..
+        P.writeSlot(itemId, 1, 0)
+    )
+end
+
 local function sendGmodPlayerTeleport(client, ply)
     if not IsValid(ply) then return end
 
@@ -591,6 +1097,7 @@ local function sendGmodPlayersToMinecraft(client)
     for _, ply in ipairs(player.GetAll()) do
         if IsValid(ply) then
             sendGmodPlayerSpawn(client, ply)
+            sendGmodPlayerEquipment(client, ply, true)
             client.spawnedGmodEntities[ply:EntIndex()] = true
         end
     end
@@ -607,6 +1114,8 @@ end
 local function sendJoinGame(client)
     local spawn = C.minecraft_spawn
 
+    log("sending minimal join game to " .. tostring(client.username or client.entityId))
+
     sendPacket(client, 0x23,
         P.writeInt(client.entityId) ..
         string.char(1) ..
@@ -618,7 +1127,13 @@ local function sendJoinGame(client)
     )
 
     sendPacket(client, 0x46, P.writePosition(spawn.x, spawn.y, spawn.z))
-    sendSpawnChunks(client)
+    if C.send_chunks_on_login then
+        sendSpawnChunks(client)
+    end
+    sendMinecraftAbilities(client, true)
+    sendMinecraftMaxHealth(client)
+    sendMinecraftHealth(client)
+    sendMinecraftCombatHotbar(client)
 
     sendPacket(client, 0x2F,
         P.writeDouble(spawn.x + 0.5) ..
@@ -629,12 +1144,19 @@ local function sendJoinGame(client)
         string.char(0) ..
         P.writeVarInt(1)
     )
+end
 
+local function sendDeferredWorldSync(client)
+    if not client or client.dead or client.state ~= STATE_PLAY then return end
+
+    log("sending deferred world sync to " .. tostring(client.username or client.entityId))
     sendTabListHeader(client)
     sendMinecraftPlayersToList(client)
     sendGmodPlayersToMinecraft(client)
-    sendBridgeArenaBlocks(client)
-    sendChat(client, "Connected to the GMod bridge. GMod is the authority.")
+    if C.send_blocks_on_login then
+        sendBridgeArenaBlocks(client)
+    end
+    sendSystemChat(client, "Connected to the GMod bridge. GMod is the authority.")
 end
 
 local function handleStatus(client, packet)
@@ -665,12 +1187,76 @@ local function handleUseEntity(client, packet)
 
     for _, ply in ipairs(player.GetAll()) do
         if IsValid(ply) and ply:EntIndex() == targetId then
-            if damageGmodPlayerFromMinecraft(client, ply, C.minecraft_crowbar_damage, 350) then
-                sendChat(client, "You hit " .. ply:Nick())
+            local damage, force = selectedMinecraftDamage(client)
+            if damageGmodPlayerFromMinecraft(client, ply, damage, force) then
+                sendSystemChat(client, "You hit " .. ply:Nick())
             end
             return
         end
     end
+end
+
+local function blockFaceOffset(face)
+    if face == 0 then return 0, -1, 0 end
+    if face == 1 then return 0, 1, 0 end
+    if face == 2 then return 0, 0, -1 end
+    if face == 3 then return 0, 0, 1 end
+    if face == 4 then return -1, 0, 0 end
+    if face == 5 then return 1, 0, 0 end
+    return 0, 1, 0
+end
+
+local function handleDigging(client, packet)
+    local status, offset = P.readVarInt(packet.payload, 1)
+    if status == 5 and client.selectedHotbarSlot == 1 then
+        fireMinecraftBow(client)
+        return
+    end
+
+    if not C.enable_minecraft_block_building then return end
+
+    local pos
+    pos, offset = P.readPosition(packet.payload, offset)
+    if not pos then
+        log((client.username or "MC") .. " sent dig packet but position decode failed")
+        return
+    end
+
+    if C.debug_block_packets then
+        log((client.username or "MC") .. " dig status=" .. tostring(status) .. " pos=" .. pos.x .. "," .. pos.y .. "," .. pos.z)
+    end
+
+    -- Treat start, finish, and creative-pick/drop variants as a completed break.
+    -- The bridge world is server-authoritative, so this keeps cracked/offline
+    -- clients from getting stuck waiting on vanilla mining state.
+    if status == 0 or status == 2 or status == 3 or status == 4 then
+        setWorldBlock(pos.x, pos.y, pos.z, 0, true)
+        sendBlockChange(client, pos.x, pos.y, pos.z, 0)
+        log((client.username or "MC") .. " removed bridge block at " .. pos.x .. "," .. pos.y .. "," .. pos.z)
+    end
+end
+
+local function handleBlockPlacement(client, packet)
+    if not C.enable_minecraft_block_building then return end
+
+    local pos, offset = P.readPosition(packet.payload, 1)
+    if not pos then
+        log((client.username or "MC") .. " sent place packet but position decode failed")
+        return
+    end
+
+    local face
+    face, offset = P.readVarInt(packet.payload, offset)
+    local dx, dy, dz = blockFaceOffset(face)
+    local x = pos.x + dx
+    local y = pos.y + dy
+    local z = pos.z + dz
+
+    setWorldBlock(x, y, z, C.minecraft_build_block_state, true)
+    if C.debug_block_packets then
+        log((client.username or "MC") .. " place face=" .. tostring(face) .. " base=" .. pos.x .. "," .. pos.y .. "," .. pos.z)
+    end
+    log((client.username or "MC") .. " placed bridge block at " .. x .. "," .. y .. "," .. z)
 end
 
 local function handleHandshake(client, packet)
@@ -694,10 +1280,16 @@ local function handleLogin(client, packet)
     client.username = username
     client.state = STATE_PLAY
     client.gmodPos = minecraftToVec(client.mcPos)
+    client.mcHealth = C.minecraft_proxy_health
+    client.deadInMinecraft = false
+    client.selectedHotbarSlot = 0
     updateMinecraftProxy(client)
 
     sendPacket(client, 0x02, P.writeString(P.writeUUID()) .. P.writeString(username))
     sendJoinGame(client)
+    timer.Simple(C.defer_world_sync_after_login or 1, function()
+        sendDeferredWorldSync(client)
+    end)
 
     PrintMessage(HUD_PRINTTALK, "[MC] " .. username .. " joined through the bridge")
     for _, other in pairs(clients) do
@@ -717,6 +1309,14 @@ local function handlePlay(client, packet)
             PrintMessage(HUD_PRINTTALK, "[MC] " .. client.username .. ": " .. message)
             broadcastChat("[MC] <" .. client.username .. "> " .. message)
         end
+    elseif packet.id == 0x03 then
+        local action = P.readVarInt(packet.payload, 1)
+        if C.debug_combat then
+            log((client.username or "MC") .. " sent client status action=" .. tostring(action) .. " dead=" .. tostring(client.deadInMinecraft))
+        end
+        if action == 0 and (client.deadInMinecraft or (client.mcHealth or C.minecraft_proxy_health) <= 0) then
+            respawnMinecraftClient(client)
+        end
     elseif packet.id == 0x0A then
         handleUseEntity(client, packet)
     elseif packet.id == 0x0B then
@@ -729,10 +1329,8 @@ local function handlePlay(client, packet)
         x, offset = P.readDouble(packet.payload, offset)
         y, offset = P.readDouble(packet.payload, offset)
         z, offset = P.readDouble(packet.payload, offset)
-        client.mcPos = { x = x or 0, y = y or 0, z = z or 0 }
-        client.gmodPos = minecraftToVec(client.mcPos)
         client.onGround = P.readByte(packet.payload, offset) == 1
-        updateMinecraftProxy(client)
+        setMinecraftClientPosition(client, x, y, z, client.yaw, client.pitch)
     elseif packet.id == 0x0E then
         local offset = 1
         local x, y, z
@@ -741,16 +1339,39 @@ local function handlePlay(client, packet)
         z, offset = P.readDouble(packet.payload, offset)
         client.yaw, offset = P.readFloat(packet.payload, offset)
         client.pitch, offset = P.readFloat(packet.payload, offset)
-        client.mcPos = { x = x or 0, y = y or 0, z = z or 0 }
-        client.gmodPos = minecraftToVec(client.mcPos)
         client.onGround = P.readByte(packet.payload, offset) == 1
-        updateMinecraftProxy(client)
+        setMinecraftClientPosition(client, x, y, z, client.yaw, client.pitch)
     elseif packet.id == 0x0F then
         local offset = 1
         client.yaw, offset = P.readFloat(packet.payload, offset)
         client.pitch, offset = P.readFloat(packet.payload, offset)
         client.onGround = P.readByte(packet.payload, offset) == 1
-        updateMinecraftProxy(client)
+        if client.mcPos then
+            setMinecraftClientPosition(client, client.mcPos.x, client.mcPos.y, client.mcPos.z, client.yaw, client.pitch)
+        else
+            updateMinecraftProxy(client)
+        end
+    elseif packet.id == 0x14 then
+        handleDigging(client, packet)
+    elseif packet.id == 0x1A then
+        local slot = P.readShort and P.readShort(packet.payload, 1) or nil
+        if not slot then
+            local a, b = string.byte(packet.payload, 1, 2)
+            if a and b then
+                slot = a * 256 + b
+                if slot >= 0x8000 then slot = slot - 0x10000 end
+            end
+        end
+        if slot and slot >= 0 and slot <= 8 then
+            client.selectedHotbarSlot = slot
+        end
+    elseif packet.id == 0x1F then
+        handleBlockPlacement(client, packet)
+    elseif C.debug_minecraft_movement and (packet.id >= 0x0B and packet.id <= 0x10) then
+        if not client.nextUnhandledMoveLog or CurTime() >= client.nextUnhandledMoveLog then
+            client.nextUnhandledMoveLog = CurTime() + 1
+            log((client.username or "MC") .. " unhandled movement-ish packet 0x" .. string.format("%02X", packet.id))
+        end
     end
 end
 
@@ -783,6 +1404,8 @@ local function acceptClients()
             entityId = nextEntityId,
             lastKeepalive = CurTime(),
             spawnedGmodEntities = {},
+            gmodEquipment = {},
+            outBuffer = "",
             mcPos = table.Copy(C.minecraft_spawn)
         }
     end
@@ -800,7 +1423,12 @@ local function pollClients()
                     local packet
                     packet, client.buffer = P.tryReadPacket(client.buffer)
                     if not packet then break end
-                    handlePacket(client, packet)
+                    local ok, err = pcall(handlePacket, client, packet)
+                    if not ok then
+                        log("packet handler error for packet 0x" .. string.format("%02X", packet.id or -1) .. ": " .. tostring(err))
+                        client.dead = true
+                        break
+                    end
                 end
             end
 
@@ -813,6 +1441,8 @@ local function pollClients()
             client.lastKeepalive = CurTime()
             sendPacket(client, 0x1F, P.writeLong())
         end
+
+        flushClientOutput(client)
 
         if client.dead then
             if client.username then
@@ -845,15 +1475,19 @@ local function syncGmodPlayers()
                 if client.state == STATE_PLAY then
                     if not client.spawnedGmodEntities[ply:EntIndex()] then
                         sendGmodPlayerSpawn(client, ply)
+                        sendGmodPlayerEquipment(client, ply, true)
                         client.spawnedGmodEntities[ply:EntIndex()] = true
                     end
 
                     sendGmodPlayerTeleport(client, ply)
+                    sendGmodPlayerEquipment(client, ply, false)
 
-                    sendPacket(client, 0x0B,
-                        P.writePosition(math.floor(pos.x), C.floor_y + 1, math.floor(pos.z)) ..
-                        P.writeVarInt(C.gmod_player_marker_block_state)
-                    )
+                    if C.enable_gmod_player_marker_blocks then
+                        sendPacket(client, 0x0B,
+                            P.writePosition(math.floor(pos.x), C.floor_y + 1, math.floor(pos.z)) ..
+                            P.writeVarInt(C.gmod_player_marker_block_state)
+                        )
+                    end
                 end
             end
         end
@@ -880,6 +1514,7 @@ local function projectProps()
 end
 
 local function syncHitboxBlocks()
+    if not C.enable_hitbox_blocks then return end
     if CurTime() - lastHitboxSync < C.hitbox_sync_interval then return end
     lastHitboxSync = CurTime()
 
@@ -893,7 +1528,7 @@ local function syncHitboxBlocks()
     end
 
     for _, ent in ipairs(ents.FindInSphere(C.gmod_origin, C.hitbox_sync_radius)) do
-        if IsValid(ent) and ent:GetClass() == "prop_physics" then
+        if IsValid(ent) and ent:GetClass() == "prop_physics" and not isSharedPlatform(ent) then
             candidates[#candidates + 1] = ent
         end
     end
@@ -912,13 +1547,36 @@ local function syncHitboxBlocks()
     end
 end
 
-local function distanceToSegment(point, startPos, endPos)
+distanceToSegment = function(point, startPos, endPos)
     local segment = endPos - startPos
     local lenSqr = segment:LengthSqr()
     if lenSqr <= 0 then return point:Distance(startPos) end
 
     local t = math.Clamp((point - startPos):Dot(segment) / lenSqr, 0, 1)
     return point:Distance(startPos + segment * t)
+end
+
+local function damageMinecraftClientsOnSegment(attacker, startPos, endPos, damage, radius)
+    local hit = false
+    radius = radius or C.minecraft_proxy_hit_radius
+    damage = math.max(1, math.floor(tonumber(damage) or 8))
+
+    for _, client in pairs(clients) do
+        if client.state == STATE_PLAY and client.gmodPos and not client.deadInMinecraft then
+            local targetPos = client.gmodPos + Vector(0, 0, 36)
+            local dist = distanceToSegment(targetPos, startPos, endPos)
+            if dist <= radius then
+                local attackerName = IsValid(attacker) and attacker:IsPlayer() and attacker:Nick() or "GMod"
+                damageMinecraftClient(client, damage, attackerName)
+                if C.debug_combat then
+                    log(attackerName .. " hit " .. tostring(client.username or "MC") .. " for " .. damage .. " hp=" .. tostring(client.mcHealth or 0))
+                end
+                hit = true
+            end
+        end
+    end
+
+    return hit
 end
 
 local function handleGmodBullets(ply, bullet)
@@ -928,15 +1586,24 @@ local function handleGmodBullets(ply, bullet)
     local endPos = startPos + bullet.Dir:GetNormalized() * (bullet.Distance or 8192)
     local damage = math.max(1, math.floor(tonumber(bullet.Damage) or 8))
 
-    for _, client in pairs(clients) do
-        if client.state == STATE_PLAY and client.gmodPos then
-            local dist = distanceToSegment(client.gmodPos + Vector(0, 0, 36), startPos, endPos)
-            if dist <= C.minecraft_proxy_hit_radius then
-                damageMinecraftClient(client, damage, ply:Nick())
-                PrintMessage(HUD_PRINTTALK, "[MCGM] " .. ply:Nick() .. " shot " .. client.username)
-            end
-        end
+    damageMinecraftClientsOnSegment(ply, startPos, endPos, damage, C.minecraft_proxy_hit_radius)
+end
+
+local function handleGmodMelee(ply)
+    if not IsValid(ply) or not ply:Alive() then return end
+
+    local weapon = ply:GetActiveWeapon()
+    if not IsValid(weapon) then return end
+
+    local class = string.lower(weapon:GetClass() or "")
+    if class == "weapon_physgun" or class == "weapon_physcannon" or class == "gmod_tool" or class == "gmod_camera" then
+        return
     end
+
+    local startPos = ply:GetShootPos()
+    local endPos = startPos + ply:GetAimVector() * (C.minecraft_proxy_melee_range or 96)
+    local damage = class == "weapon_crowbar" and C.minecraft_sword_damage or 10
+    damageMinecraftClientsOnSegment(ply, startPos, endPos, damage, C.minecraft_proxy_hit_radius)
 end
 
 function MC_GM.Start()
@@ -953,6 +1620,9 @@ function MC_GM.Start()
     socketLib = lib
     server = assert(socketLib.bind("*", C.port))
     server:settimeout(0)
+    loadWorldStorage()
+    ensureBasePlatformBlocks()
+    rebuildMinecraftBlockEnts()
     createSharedPlatform()
 
     timer.Create("MCGM_Tick", C.tick_interval, 0, function()
@@ -976,7 +1646,11 @@ function MC_GM.Start()
             for _, client in pairs(clients) do
                 if client.state == STATE_PLAY then
                     client.spawnedGmodEntities[ply:EntIndex()] = nil
+                    if client.gmodEquipment then
+                        client.gmodEquipment[ply:EntIndex()] = nil
+                    end
                     sendGmodPlayerSpawn(client, ply)
+                    sendGmodPlayerEquipment(client, ply, true)
                     sendGmodPlayerTeleport(client, ply)
                     client.spawnedGmodEntities[ply:EntIndex()] = true
                 end
@@ -998,11 +1672,32 @@ function MC_GM.Start()
         log("moved GMod players to the shared bridge spawn")
     end)
 
+    concommand.Add("mcgm_world_save", function(ply)
+        if IsValid(ply) and not ply:IsAdmin() then return end
+        saveWorldStorage()
+        log("saved " .. table.Count(worldBlocks) .. " Minecraft bridge blocks")
+    end)
+
+    concommand.Add("mcgm_rebuild_blocks", function(ply)
+        if IsValid(ply) and not ply:IsAdmin() then return end
+        rebuildMinecraftBlockEnts()
+        log("rebuilt " .. table.Count(minecraftBlockEnts) .. " GMod block entities")
+    end)
+
+    concommand.Add("mcgm_test_block", function(ply)
+        if IsValid(ply) and not ply:IsAdmin() then return end
+        setWorldBlock(C.minecraft_spawn.x, C.minecraft_spawn.y, C.minecraft_spawn.z, C.minecraft_build_block_state, true)
+        log("spawned test Minecraft-origin block at bridge origin")
+    end)
+
     hook.Add("PlayerDisconnected", "MCGM_RemoveGmodPlayerFromMinecraft", function(ply)
         for _, client in pairs(clients) do
             if client.state == STATE_PLAY then
                 sendPlayerListRemove(client, P.writeUUIDBytes(100000 + ply:EntIndex()))
                 client.spawnedGmodEntities[ply:EntIndex()] = nil
+                if client.gmodEquipment then
+                    client.gmodEquipment[ply:EntIndex()] = nil
+                end
             end
         end
     end)
@@ -1013,13 +1708,50 @@ function MC_GM.Start()
         end
     end)
 
+    hook.Add("KeyPress", "MCGM_GmodMeleeHitMinecraft", function(ply, key)
+        if key == IN_ATTACK then
+            handleGmodMelee(ply)
+        end
+    end)
+
     hook.Add("EntityTakeDamage", "MCGM_ProxyDamageToMinecraft", function(ent, dmg)
+        if IsValid(ent) and ent.MCGM_BlockKey and C.shared_platform_destructible then
+            local x, y, z = parseBlockKey(ent.MCGM_BlockKey)
+            if x and y and z then
+                setWorldBlock(x, y, z, 0, true)
+                return true
+            end
+        end
+
+        if not C.shared_platform_destructible and isProtectedBridgeEntity(ent) then
+            dmg:SetDamage(0)
+            return true
+        end
+
         local client = proxyOwners[ent]
         if client then
             local attacker = dmg:GetAttacker()
             local name = IsValid(attacker) and attacker:IsPlayer() and attacker:Nick() or "GMod"
             damageMinecraftClient(client, math.max(1, math.floor(dmg:GetDamage())), name)
             return true
+        end
+    end)
+
+    hook.Add("PhysgunPickup", "MCGM_ProtectBridgePhysgun", function(ply, ent)
+        if not C.shared_platform_destructible and isProtectedBridgeEntity(ent) then
+            return false
+        end
+    end)
+
+    hook.Add("GravGunPickupAllowed", "MCGM_ProtectBridgeGravgun", function(ply, ent)
+        if not C.shared_platform_destructible and isProtectedBridgeEntity(ent) then
+            return false
+        end
+    end)
+
+    hook.Add("CanTool", "MCGM_ProtectBridgeToolgun", function(ply, tr)
+        if tr and not C.shared_platform_destructible and isProtectedBridgeEntity(tr.Entity) then
+            return false
         end
     end)
 
@@ -1033,9 +1765,21 @@ function MC_GM.Stop()
     hook.Remove("PlayerInitialSpawn", "MCGM_InitialSpawnOnBridge")
     hook.Remove("PlayerDisconnected", "MCGM_RemoveGmodPlayerFromMinecraft")
     concommand.Remove("mcgm_spawn_bridge")
+    concommand.Remove("mcgm_world_save")
+    concommand.Remove("mcgm_rebuild_blocks")
+    concommand.Remove("mcgm_test_block")
     hook.Remove("EntityFireBullets", "MCGM_GmodBulletsHitMinecraft")
+    hook.Remove("KeyPress", "MCGM_GmodMeleeHitMinecraft")
     hook.Remove("EntityTakeDamage", "MCGM_ProxyDamageToMinecraft")
+    hook.Remove("PhysgunPickup", "MCGM_ProtectBridgePhysgun")
+    hook.Remove("GravGunPickupAllowed", "MCGM_ProtectBridgeGravgun")
+    hook.Remove("CanTool", "MCGM_ProtectBridgeToolgun")
     removeSharedPlatform()
+
+    for key, ent in pairs(minecraftBlockEnts) do
+        if IsValid(ent) then ent:Remove() end
+        minecraftBlockEnts[key] = nil
+    end
 
     for _, client in pairs(clients) do
         removeMinecraftProxy(client)

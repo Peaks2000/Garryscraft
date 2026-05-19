@@ -85,6 +85,18 @@ function P.writeShort(value)
     return string.char(band(rshift(value, 8), 0xFF), band(value, 0xFF))
 end
 
+function P.writeSlot(itemId, count, damage)
+    itemId = tonumber(itemId) or -1
+    if itemId < 0 then
+        return P.writeShort(-1)
+    end
+
+    return P.writeShort(itemId) ..
+        string.char(tonumber(count) or 1) ..
+        P.writeShort(tonumber(damage) or 0) ..
+        "\0"
+end
+
 function P.readDouble(data, offset)
     if string.unpack then
         local value = string.unpack(">d", data, offset)
@@ -197,6 +209,15 @@ function P.writeInt(value)
     )
 end
 
+function P.readInt(data, offset)
+    local a, b, c, d = byte(data, offset), byte(data, offset + 1), byte(data, offset + 2), byte(data, offset + 3)
+    if not a or not b or not c or not d then return nil, offset end
+
+    local value = a * 16777216 + b * 65536 + c * 256 + d
+    if value >= 0x80000000 then value = value - 0x100000000 end
+    return value, offset + 4
+end
+
 function P.writeLittleShort(value)
     value = tonumber(value) or 0
     if value < 0 then value = 0x10000 + value end
@@ -206,6 +227,25 @@ end
 function P.readLong(data, offset)
     if #data < offset + 7 then return nil, offset end
     return string.sub(data, offset, offset + 7), offset + 8
+end
+
+function P.readPosition(data, offset)
+    local hi, nextOffset = P.readInt(data, offset)
+    local lo
+    lo, nextOffset = P.readInt(data, nextOffset)
+    if not hi or not lo then return nil, offset end
+
+    local unsignedHi = hi < 0 and hi + 0x100000000 or hi
+    local unsignedLo = lo < 0 and lo + 0x100000000 or lo
+    local x = math.floor(unsignedHi / 0x40)
+    local z = bit.bor(bit.lshift(bit.band(unsignedHi, 0x3F), 20), bit.rshift(unsignedLo, 12))
+    local y = bit.band(unsignedLo, 0xFFF)
+
+    if x >= 0x2000000 then x = x - 0x4000000 end
+    if z >= 0x2000000 then z = z - 0x4000000 end
+    if y >= 0x800 then y = y - 0x1000 end
+
+    return { x = x, y = y, z = z }, nextOffset
 end
 
 function P.writeLong(value)

@@ -27,6 +27,7 @@ Environment variables:
   GAMEMODE       GMod gamemode. Default: sandbox
   TICKRATE       srcds tickrate. Default: 33
   INSTALL_MODE   symlink or copy. Default: symlink
+                 Existing addon folders are backed up automatically.
 
 Examples:
   GMOD_DIR="$HOME/servers/gmod" ./scripts/run-gmod-bridge.sh
@@ -70,30 +71,34 @@ mkdir -p "$ADDONS_DIR"
 
 if [[ "$INSTALL_MODE" == "copy" ]]; then
     if [[ -e "$TARGET_ADDON" || -L "$TARGET_ADDON" ]]; then
-        cat >&2 <<EOF
-Addon target already exists:
-  $TARGET_ADDON
-
-Move or remove it first, then run this script again.
-EOF
-        exit 1
+        BACKUP_ADDON="${TARGET_ADDON}.backup.$(date +%Y%m%d-%H%M%S)"
+        echo "Existing addon found; moving it to:"
+        echo "  $BACKUP_ADDON"
+        mv "$TARGET_ADDON" "$BACKUP_ADDON"
     fi
     mkdir -p "$TARGET_ADDON"
     cp -R "$ROOT_DIR/lua" "$ROOT_DIR/README.md" "$TARGET_ADDON/"
 else
     if [[ -e "$TARGET_ADDON" || -L "$TARGET_ADDON" ]]; then
-        if [[ "$(readlink "$TARGET_ADDON" 2>/dev/null || true)" != "$ROOT_DIR" ]]; then
-            cat >&2 <<EOF
-Addon target already exists:
-  $TARGET_ADDON
-
-Move or remove it first, then run this script again.
-EOF
-            exit 1
+        CURRENT_LINK="$(readlink "$TARGET_ADDON" 2>/dev/null || true)"
+        if [[ "$CURRENT_LINK" == "$ROOT_DIR" ]]; then
+            echo "Addon symlink already points at this repo:"
+            echo "  $TARGET_ADDON"
+        elif [[ -L "$TARGET_ADDON" ]]; then
+            echo "Replacing old addon symlink:"
+            echo "  $TARGET_ADDON -> $CURRENT_LINK"
+            rm "$TARGET_ADDON"
+            ln -s "$ROOT_DIR" "$TARGET_ADDON"
+        else
+            BACKUP_ADDON="${TARGET_ADDON}.backup.$(date +%Y%m%d-%H%M%S)"
+            echo "Existing addon folder found; moving it to:"
+            echo "  $BACKUP_ADDON"
+            mv "$TARGET_ADDON" "$BACKUP_ADDON"
+            ln -s "$ROOT_DIR" "$TARGET_ADDON"
         fi
-        rm "$TARGET_ADDON"
+    else
+        ln -s "$ROOT_DIR" "$TARGET_ADDON"
     fi
-    ln -s "$ROOT_DIR" "$TARGET_ADDON"
 fi
 
 cat <<EOF

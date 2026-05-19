@@ -1,6 +1,8 @@
 if SERVER then
     MC_GM = MC_GM or {}
 
+    AddCSLuaFile("autorun/client/mcgm_nametags.lua")
+
     include("mcgm/config.lua")
     include("mcgm/protocol.lua")
     include("mcgm/bridge.lua")
