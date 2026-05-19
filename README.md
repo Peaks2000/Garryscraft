@@ -1,4 +1,4 @@
-# MC+GM
+# GarrysCraft
 
 Experimental Minecraft Java <-> Garry's Mod bridge.
 
