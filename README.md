@@ -35,7 +35,7 @@ authentication is performed.
 - Experimental prop projection:
   - Nearby GMod physics props are sampled and sent as simple Minecraft block
     changes.
-
+  shared blocks
 ## Requirements
 
 Stock GMod Lua cannot open a raw TCP server. Install a LuaSocket-compatible GMod
@@ -105,4 +105,4 @@ Important settings:
 This is a first working scaffold, not a production-quality protocol
 implementation. Minecraft clients expect chunks, dimensions, entity metadata,
 and keepalives to be exactly right across versions. The next big milestone is
-proper entity metadata, richer block projection, and collision-aware movement.
+proper entity metadata, and collision-aware movement.
