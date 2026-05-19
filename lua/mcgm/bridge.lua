@@ -32,6 +32,8 @@ local isSharedPlatform
 local sendBridgeArenaBlocks
 local sendSpawnChunks
 local distanceToSegment
+local sendGmodPlayersToMinecraft
+local sendGmodPlayerEquipment
 
 local function log(msg)
     MsgC(Color(90, 200, 255), "[MCGM] ", color_white, tostring(msg), "\n")
@@ -214,6 +216,8 @@ local function updateMinecraftProxy(client)
         ent:SetName("mcgm_" .. tostring(client.username or client.entityId))
         ent:SetNWBool("MCGM_MinecraftProxy", C.enable_minecraft_nametags)
         ent:SetNWString("MCGM_Name", "[MC] " .. tostring(client.username or "Minecraft"))
+        ent:SetNoDraw(false)
+        ent:DrawShadow(true)
         if ent.LookupSequence and ent.ResetSequence then
             local seq = ent:LookupSequence("idle_all_01")
             if seq and seq >= 0 then
@@ -233,6 +237,8 @@ local function updateMinecraftProxy(client)
     client.proxyEnt:SetCollisionBounds(C.minecraft_proxy_mins or Vector(-16, -16, 0), C.minecraft_proxy_maxs or Vector(16, 16, 72))
     client.proxyEnt:SetNWBool("MCGM_MinecraftProxy", C.enable_minecraft_nametags)
     client.proxyEnt:SetNWString("MCGM_Name", "[MC] " .. tostring(client.username or "Minecraft"))
+    client.proxyEnt:SetNoDraw(false)
+    client.proxyEnt:DrawShadow(true)
     local phys = client.proxyEnt:GetPhysicsObject()
     if IsValid(phys) then
         phys:SetPos(client.gmodPos)
@@ -261,6 +267,11 @@ local function removeMinecraftProxy(client)
         client.proxyEnt:Remove()
     end
     client.proxyEnt = nil
+end
+
+local function recreateMinecraftProxy(client)
+    removeMinecraftProxy(client)
+    updateMinecraftProxy(client)
 end
 
 local function sendSetSlot(client, slot, itemId, count, damage)
@@ -321,7 +332,7 @@ local function respawnMinecraftClient(client)
     client.mcHealth = C.minecraft_proxy_health
     client.mcPos = table.Copy(spawn)
     client.gmodPos = minecraftToVec(client.mcPos)
-    updateMinecraftProxy(client)
+    recreateMinecraftProxy(client)
 
     -- Vanilla 1.12 clients need a dimension change before respawning back into
     -- the same dimension, otherwise the respawn screen can get stuck.
@@ -354,6 +365,13 @@ local function respawnMinecraftClient(client)
         string.char(0) ..
         P.writeVarInt(math.floor(CurTime() * 1000) % 2147483647)
     )
+    client.spawnedGmodEntities = {}
+    client.pendingGmodSpawns = {}
+    timer.Simple(0.5, function()
+        if client and not client.dead and client.state == STATE_PLAY then
+            sendGmodPlayersToMinecraft(client)
+        end
+    end)
 end
 
 local function killMinecraftClient(client, attackerName)
@@ -527,6 +545,13 @@ local function sendPlayerListRemove(client, uuidBytes)
         P.writeVarInt(4) ..
         P.writeVarInt(1) ..
         uuidBytes
+    )
+end
+
+local function sendDestroyEntity(client, entityId)
+    sendPacket(client, 0x32,
+        P.writeVarInt(1) ..
+        P.writeVarInt(entityId)
     )
 end
 
@@ -1004,18 +1029,60 @@ local function sendGmodPlayerSpawn(client, ply)
     local yaw = minecraftAngle(angles.y)
     local pitch = minecraftAngle(angles.p)
 
+    if C.gmod_minecraft_entity_mode == "mob" then
+        sendPacket(client, 0x03,
+            P.writeVarInt(ply:EntIndex()) ..
+            P.writeUUIDBytes(100000 + ply:EntIndex()) ..
+            P.writeVarInt(C.gmod_minecraft_entity_type or 54) ..
+            P.writeDouble(pos.x) ..
+            P.writeDouble(pos.y) ..
+            P.writeDouble(pos.z) ..
+            string.char(yaw) ..
+            string.char(pitch) ..
+            string.char(yaw) ..
+            P.writeShort(0) ..
+            P.writeShort(0) ..
+            P.writeShort(0) ..
+            "\255"
+        )
+    else
+        sendPacket(client, 0x05,
+            P.writeVarInt(ply:EntIndex()) ..
+            P.writeUUIDBytes(100000 + ply:EntIndex()) ..
+            P.writeDouble(pos.x) ..
+            P.writeDouble(pos.y) ..
+            P.writeDouble(pos.z) ..
+            string.char(yaw) ..
+            string.char(pitch) ..
+            "\255"
+        )
+    end
+
+    sendPacket(client, 0x36,
+        P.writeVarInt(ply:EntIndex()) ..
+        string.char(yaw)
+    )
+end
+
+local function scheduleGmodPlayerSpawn(client, ply)
+    if not client or client.dead or client.state ~= STATE_PLAY or not IsValid(ply) then return end
+
+    local entIndex = ply:EntIndex()
+    client.pendingGmodSpawns = client.pendingGmodSpawns or {}
+    if client.spawnedGmodEntities[entIndex] or client.pendingGmodSpawns[entIndex] then return end
+    client.pendingGmodSpawns[entIndex] = true
+
     addGmodPlayerToMinecraftList(client, ply)
 
-    sendPacket(client, 0x05,
-        P.writeVarInt(ply:EntIndex()) ..
-        P.writeUUIDBytes(100000 + ply:EntIndex()) ..
-        P.writeDouble(pos.x) ..
-        P.writeDouble(pos.y) ..
-        P.writeDouble(pos.z) ..
-        string.char(yaw) ..
-        string.char(pitch) ..
-        "\255"
-    )
+    timer.Simple(C.gmod_player_spawn_delay or 0.25, function()
+        if client and client.pendingGmodSpawns then
+            client.pendingGmodSpawns[entIndex] = nil
+        end
+        if not client or client.dead or client.state ~= STATE_PLAY or not IsValid(ply) then return end
+        sendGmodPlayerSpawn(client, ply)
+        sendGmodPlayerEquipment(client, ply, true)
+        client.spawnedGmodEntities[entIndex] = true
+    end)
 end
 
 local function weaponClassToMinecraftItem(class)
@@ -1058,7 +1125,7 @@ local function getGmodPlayerEquipmentItem(ply)
     return weaponClassToMinecraftItem(weapon:GetClass())
 end
 
-local function sendGmodPlayerEquipment(client, ply, force)
+sendGmodPlayerEquipment = function(client, ply, force)
     if not C.enable_gmod_equipment_sync or not IsValid(ply) then return end
 
     client.gmodEquipment = client.gmodEquipment or {}
@@ -1093,12 +1160,10 @@ local function sendGmodPlayerTeleport(client, ply)
     )
 end
 
-local function sendGmodPlayersToMinecraft(client)
+sendGmodPlayersToMinecraft = function(client)
     for _, ply in ipairs(player.GetAll()) do
         if IsValid(ply) then
-            sendGmodPlayerSpawn(client, ply)
-            sendGmodPlayerEquipment(client, ply, true)
-            client.spawnedGmodEntities[ply:EntIndex()] = true
+            scheduleGmodPlayerSpawn(client, ply)
         end
     end
 end
@@ -1404,6 +1469,7 @@ local function acceptClients()
             entityId = nextEntityId,
             lastKeepalive = CurTime(),
             spawnedGmodEntities = {},
+            pendingGmodSpawns = {},
             gmodEquipment = {},
             outBuffer = "",
             mcPos = table.Copy(C.minecraft_spawn)
@@ -1474,13 +1540,13 @@ local function syncGmodPlayers()
             for _, client in pairs(clients) do
                 if client.state == STATE_PLAY then
                     if not client.spawnedGmodEntities[ply:EntIndex()] then
-                        sendGmodPlayerSpawn(client, ply)
-                        sendGmodPlayerEquipment(client, ply, true)
-                        client.spawnedGmodEntities[ply:EntIndex()] = true
+                        scheduleGmodPlayerSpawn(client, ply)
                     end
 
-                    sendGmodPlayerTeleport(client, ply)
-                    sendGmodPlayerEquipment(client, ply, false)
+                    if client.spawnedGmodEntities[ply:EntIndex()] then
+                        sendGmodPlayerTeleport(client, ply)
+                        sendGmodPlayerEquipment(client, ply, false)
+                    end
 
                     if C.enable_gmod_player_marker_blocks then
                         sendPacket(client, 0x0B,
@@ -1646,13 +1712,14 @@ function MC_GM.Start()
             for _, client in pairs(clients) do
                 if client.state == STATE_PLAY then
                     client.spawnedGmodEntities[ply:EntIndex()] = nil
+                    if client.pendingGmodSpawns then
+                        client.pendingGmodSpawns[ply:EntIndex()] = nil
+                    end
                     if client.gmodEquipment then
                         client.gmodEquipment[ply:EntIndex()] = nil
                     end
-                    sendGmodPlayerSpawn(client, ply)
-                    sendGmodPlayerEquipment(client, ply, true)
-                    sendGmodPlayerTeleport(client, ply)
-                    client.spawnedGmodEntities[ply:EntIndex()] = true
+                    sendDestroyEntity(client, ply:EntIndex())
+                    scheduleGmodPlayerSpawn(client, ply)
                 end
             end
         end)
@@ -1694,7 +1761,11 @@ function MC_GM.Start()
         for _, client in pairs(clients) do
             if client.state == STATE_PLAY then
                 sendPlayerListRemove(client, P.writeUUIDBytes(100000 + ply:EntIndex()))
+                sendDestroyEntity(client, ply:EntIndex())
                 client.spawnedGmodEntities[ply:EntIndex()] = nil
+                if client.pendingGmodSpawns then
+                    client.pendingGmodSpawns[ply:EntIndex()] = nil
+                end
                 if client.gmodEquipment then
                     client.gmodEquipment[ply:EntIndex()] = nil
                 end
