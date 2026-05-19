@@ -560,6 +560,32 @@ local function replayWorldBlocks(client, quiet, limit)
     end
 end
 
+local function resetBridgeWorldBlocks()
+    for key, ent in pairs(minecraftBlockEnts) do
+        if IsValid(ent) then ent:Remove() end
+        minecraftBlockEnts[key] = nil
+    end
+
+    for key in pairs(worldBlocks) do
+        local x, y, z = parseBlockKey(key)
+        if x and y and z then
+            broadcastBlockChange(x, y, z, 0)
+        end
+        worldBlocks[key] = nil
+    end
+
+    saveWorldStorage()
+    resendSpawnChunksToMinecraft()
+    for _, client in pairs(clients) do
+        if client.state == STATE_PLAY then
+            client.spawnedGmodEntities = {}
+            client.pendingGmodSpawns = {}
+            sendGmodPlayersToMinecraft(client)
+        end
+    end
+    log("reset Minecraft bridge world blocks")
+end
+
 local function chatPayload(text, position)
     local json = "{\"text\":\"" .. P.jsonString(text) .. "\"}"
     return P.writeString(json) .. string.char(position or 0)
@@ -792,6 +818,13 @@ local function minecraftCommand(client, message)
         return true
     end
 
+    if command == "/resetworld" or command == "/resetblocks" then
+        resetBridgeWorldBlocks()
+        sendChat(client, "Bridge world reset. Stored blocks cleared.")
+        PrintMessage(HUD_PRINTTALK, "[MC] " .. client.username .. " reset the bridge world")
+        return true
+    end
+
     if command == "/rebuildblocks" then
         rebuildMinecraftBlockEnts()
         sendSystemChat(client, "Rebuilt GMod block ents: " .. table.Count(minecraftBlockEnts))
@@ -812,7 +845,7 @@ local function minecraftCommand(client, message)
     end
 
     if command == "/help" then
-        sendChat(client, "Bridge commands: /crowbar, /blast, /where, /proxy, /sync, /break, /debugblocks, /rebuildblocks, /testblock")
+        sendChat(client, "Bridge commands: /crowbar, /blast, /where, /proxy, /sync, /break, /debugblocks, /resetworld, /rebuildblocks, /testblock")
         return true
     end
 
@@ -1842,6 +1875,11 @@ function MC_GM.Start()
         log("saved " .. table.Count(worldBlocks) .. " Minecraft bridge blocks")
     end)
 
+    concommand.Add("mcgm_world_reset", function(ply)
+        if IsValid(ply) and not ply:IsAdmin() then return end
+        resetBridgeWorldBlocks()
+    end)
+
     concommand.Add("mcgm_block_place", function(ply)
         if IsValid(ply) and not ply:Alive() then return end
         if not gmodPlaceBridgeBlock(ply) then
@@ -1955,6 +1993,7 @@ function MC_GM.Stop()
     hook.Remove("PlayerDisconnected", "MCGM_RemoveGmodPlayerFromMinecraft")
     concommand.Remove("mcgm_spawn_bridge")
     concommand.Remove("mcgm_world_save")
+    concommand.Remove("mcgm_world_reset")
     concommand.Remove("mcgm_block_place")
     concommand.Remove("mcgm_block_break")
     concommand.Remove("mcgm_block_test_visible")
