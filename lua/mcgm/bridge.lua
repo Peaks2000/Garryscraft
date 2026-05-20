@@ -26,14 +26,19 @@ local ITEM_IRON_SWORD = 267
 
 local sendPacket
 local sendChat
+local sendSystemChat
 local broadcastChat
 local chatJson
 local isSharedPlatform
+local minecraftAngle
 local sendBridgeArenaBlocks
 local sendSpawnChunks
 local distanceToSegment
 local sendGmodPlayersToMinecraft
+local sendMinecraftPlayersToMinecraft
 local sendGmodPlayerEquipment
+local sendDeferredWorldSync
+local refreshMinecraftPlayerForViewers
 
 local function log(msg)
     MsgC(Color(90, 200, 255), "[MCGM] ", color_white, tostring(msg), "\n")
@@ -41,6 +46,10 @@ end
 
 local function blockKey(x, y, z)
     return tostring(math.floor(x)) .. "," .. tostring(math.floor(y)) .. "," .. tostring(math.floor(z))
+end
+
+local function getWorldBlock(x, y, z)
+    return worldBlocks[blockKey(x, y, z)]
 end
 
 local function parseBlockKey(key)
@@ -129,6 +138,12 @@ local function minecraftBlockToVec(x, y, z)
     return minecraftToVec({ x = x + 0.5, y = y + 0.5, z = z + 0.5 })
 end
 
+local function enablePlayerBlockCollisionRule(ent)
+    if IsValid(ent) and ent.SetCustomCollisionCheck then
+        ent:SetCustomCollisionCheck(true)
+    end
+end
+
 local function removeMinecraftBlockEnt(key)
     if IsValid(minecraftBlockEnts[key]) then
         minecraftBlockEnts[key]:Remove()
@@ -177,6 +192,7 @@ local function spawnMinecraftBlockEnt(x, y, z, state)
     ent:SetSolid(C.minecraft_block_solid and SOLID_BBOX or SOLID_NONE)
     ent:SetCollisionBounds(C.minecraft_block_mins or Vector(-16, -16, -16), C.minecraft_block_maxs or Vector(16, 16, 16))
     ent:SetCollisionGroup(COLLISION_GROUP_NONE)
+    enablePlayerBlockCollisionRule(ent)
 
     local phys = ent:GetPhysicsObject()
     if IsValid(phys) then
@@ -187,6 +203,54 @@ local function spawnMinecraftBlockEnt(x, y, z, state)
 
     if C.debug_gmod_block_spawns then
         log("spawned GMod block " .. key .. " at " .. tostring(pos) .. " model=" .. tostring(model))
+    end
+end
+
+local function applySoftMinecraftBlockCollision(ply)
+    if not C.minecraft_block_soft_player_collision or not IsValid(ply) or not ply:Alive() then return end
+
+    local plyPos = ply:GetPos()
+    local playerHalfWidth = 16
+    local playerHeight = 72
+    local blockHalf = C.minecraft_block_soft_collision_half_size or 16
+    local expandedHalf = blockHalf + playerHalfWidth
+    local margin = 0.5
+    local newPos = Vector(plyPos.x, plyPos.y, plyPos.z)
+    local moved = false
+
+    for _, ent in pairs(minecraftBlockEnts) do
+        if IsValid(ent) then
+            local blockPos = ent:GetPos()
+            local blockBottom = blockPos.z - blockHalf
+            local blockTop = blockPos.z + blockHalf
+            local playerBottom = newPos.z
+            local playerTop = newPos.z + playerHeight
+
+            if playerTop > blockBottom and playerBottom < blockTop then
+                local dx = newPos.x - blockPos.x
+                local dy = newPos.y - blockPos.y
+                local absX = math.abs(dx)
+                local absY = math.abs(dy)
+
+                if absX < expandedHalf and absY < expandedHalf then
+                    local pushX = expandedHalf - absX + margin
+                    local pushY = expandedHalf - absY + margin
+
+                    if pushX < pushY then
+                        newPos.x = newPos.x + (dx >= 0 and pushX or -pushX)
+                    else
+                        newPos.y = newPos.y + (dy >= 0 and pushY or -pushY)
+                    end
+                    moved = true
+                end
+            end
+        end
+    end
+
+    if moved then
+        ply:SetPos(newPos)
+        local velocity = ply:GetVelocity()
+        ply:SetVelocity(Vector(-velocity.x * 0.5, -velocity.y * 0.5, 0))
     end
 end
 
@@ -275,6 +339,15 @@ local function removeMinecraftProxy(client)
         client.proxyEnt:Remove()
     end
     client.proxyEnt = nil
+end
+
+local function resetClientVisibleEntities(client)
+    if not client then return end
+
+    client.spawnedGmodEntities = {}
+    client.pendingGmodSpawns = {}
+    client.spawnedMinecraftEntities = {}
+    client.pendingMinecraftSpawns = {}
 end
 
 local function recreateMinecraftProxy(client)
@@ -373,12 +446,12 @@ local function respawnMinecraftClient(client)
         string.char(0) ..
         P.writeVarInt(math.floor(CurTime() * 1000) % 2147483647)
     )
-    client.spawnedGmodEntities = {}
-    client.pendingGmodSpawns = {}
-    timer.Simple(0.5, function()
-        if client and not client.dead and client.state == STATE_PLAY then
-            sendGmodPlayersToMinecraft(client)
-        end
+    resetClientVisibleEntities(client)
+    if refreshMinecraftPlayerForViewers then
+        refreshMinecraftPlayerForViewers(client)
+    end
+    timer.Simple(C.defer_world_sync_after_respawn or 0.75, function()
+        sendDeferredWorldSync(client)
     end)
 end
 
@@ -489,15 +562,98 @@ local function setWorldBlock(x, y, z, state, persist)
     broadcastBlockChange(x, y, z, state)
 end
 
+local function rayAabbTrace(startPos, dir, minPos, maxPos, maxDist)
+    local enter = 0
+    local exit = maxDist
+    local hitNormal = Vector(0, 0, 0)
+
+    local axes = {
+        { s = startPos.x, d = dir.x, min = minPos.x, max = maxPos.x, normal = Vector(1, 0, 0) },
+        { s = startPos.y, d = dir.y, min = minPos.y, max = maxPos.y, normal = Vector(0, 1, 0) },
+        { s = startPos.z, d = dir.z, min = minPos.z, max = maxPos.z, normal = Vector(0, 0, 1) }
+    }
+
+    for _, axis in ipairs(axes) do
+        if math.abs(axis.d) < 0.000001 then
+            if axis.s < axis.min or axis.s > axis.max then return nil end
+        else
+            local t1 = (axis.min - axis.s) / axis.d
+            local t2 = (axis.max - axis.s) / axis.d
+            local normal = axis.normal
+
+            if t1 > t2 then
+                t1, t2 = t2, t1
+                normal = -axis.normal
+            end
+
+            if t1 > enter then
+                enter = t1
+                hitNormal = normal
+            end
+
+            exit = math.min(exit, t2)
+            if enter > exit then return nil end
+        end
+    end
+
+    if enter < 0 or enter > maxDist then return nil end
+    return enter, hitNormal
+end
+
+local function traceMinecraftBlockEnts(startPos, dir, maxDist)
+    local bestDist
+    local bestEnt
+    local bestNormal
+    local half = C.world_scale * 0.5
+
+    for _, ent in pairs(minecraftBlockEnts) do
+        if IsValid(ent) then
+            local pos = ent:GetPos()
+            local dist, normal = rayAabbTrace(
+                startPos,
+                dir,
+                pos - Vector(half, half, half),
+                pos + Vector(half, half, half),
+                maxDist
+            )
+
+            if dist and (not bestDist or dist < bestDist) then
+                bestDist = dist
+                bestEnt = ent
+                bestNormal = normal
+            end
+        end
+    end
+
+    if not bestEnt then return nil end
+
+    return {
+        Hit = true,
+        Entity = bestEnt,
+        HitPos = startPos + dir * bestDist,
+        HitNormal = bestNormal
+    }
+end
+
 local function gmodTraceForBlock(ply)
     if not IsValid(ply) then return nil end
+    local startPos = ply:GetShootPos()
+    local dir = ply:GetAimVector()
+    local maxDist = C.gmod_block_place_range or 512
 
-    return util.TraceLine({
-        start = ply:GetShootPos(),
-        endpos = ply:GetShootPos() + ply:GetAimVector() * (C.gmod_block_place_range or 512),
+    local solidTrace = util.TraceLine({
+        start = startPos,
+        endpos = startPos + dir * maxDist,
         filter = ply,
         mask = MASK_SOLID
     })
+
+    local blockTrace = traceMinecraftBlockEnts(startPos, dir, maxDist)
+    if blockTrace and (not solidTrace.Hit or startPos:Distance(blockTrace.HitPos) < startPos:Distance(solidTrace.HitPos)) then
+        return blockTrace
+    end
+
+    return solidTrace
 end
 
 local function gmodPlaceBridgeBlock(ply)
@@ -599,7 +755,7 @@ sendChat = function(client, text)
     sendPacket(client, 0x0F, chatPayload(text, 0))
 end
 
-local function sendSystemChat(client, text)
+sendSystemChat = function(client, text)
     if C.quiet_minecraft_system_chat then
         log("MC system chat suppressed: " .. tostring(text))
         return
@@ -666,6 +822,7 @@ end
 
 local function addMinecraftPlayerToList(client, other)
     if not other or not other.username then return end
+    if other == client then return end
     sendPlayerListAdd(
         client,
         P.writeUUIDBytes(other.entityId),
@@ -673,6 +830,117 @@ local function addMinecraftPlayerToList(client, other)
         "[MC] " .. other.username,
         0
     )
+end
+
+local function minecraftPlayerAngle(degrees)
+    return minecraftAngle(tonumber(degrees) or 0)
+end
+
+local function sendMinecraftPlayerSpawn(client, other)
+    if not C.enable_minecraft_player_visibility then return end
+    if not client or not other or client == other then return end
+    if client.state ~= STATE_PLAY or other.state ~= STATE_PLAY then return end
+    if not other.username or not other.mcPos then return end
+
+    client.spawnedMinecraftEntities = client.spawnedMinecraftEntities or {}
+    if client.spawnedMinecraftEntities[other.entityId] then return end
+
+    addMinecraftPlayerToList(client, other)
+
+    sendPacket(client, 0x05,
+        P.writeVarInt(other.entityId) ..
+        P.writeUUIDBytes(other.entityId) ..
+        P.writeDouble(other.mcPos.x) ..
+        P.writeDouble(other.mcPos.y) ..
+        P.writeDouble(other.mcPos.z) ..
+        string.char(minecraftPlayerAngle(other.yaw)) ..
+        string.char(minecraftPlayerAngle(other.pitch)) ..
+        "\255"
+    )
+
+    sendPacket(client, 0x36,
+        P.writeVarInt(other.entityId) ..
+        string.char(minecraftPlayerAngle(other.yaw))
+    )
+
+    client.spawnedMinecraftEntities[other.entityId] = true
+end
+
+local function scheduleMinecraftPlayerSpawn(client, other)
+    if not C.enable_minecraft_player_visibility then return end
+    if not client or not other or client == other then return end
+    if client.state ~= STATE_PLAY or other.state ~= STATE_PLAY then return end
+
+    client.spawnedMinecraftEntities = client.spawnedMinecraftEntities or {}
+    client.pendingMinecraftSpawns = client.pendingMinecraftSpawns or {}
+    if client.spawnedMinecraftEntities[other.entityId] or client.pendingMinecraftSpawns[other.entityId] then return end
+
+    client.pendingMinecraftSpawns[other.entityId] = true
+    addMinecraftPlayerToList(client, other)
+
+    timer.Simple(C.minecraft_player_spawn_delay or 0.15, function()
+        if client and client.pendingMinecraftSpawns then
+            client.pendingMinecraftSpawns[other.entityId] = nil
+        end
+        sendMinecraftPlayerSpawn(client, other)
+    end)
+end
+
+local function sendMinecraftPlayerTeleport(client, other)
+    if not C.enable_minecraft_player_visibility then return end
+    if not client or not other or client == other then return end
+    if client.state ~= STATE_PLAY or other.state ~= STATE_PLAY then return end
+    if not other.mcPos then return end
+
+    if not client.spawnedMinecraftEntities or not client.spawnedMinecraftEntities[other.entityId] then
+        scheduleMinecraftPlayerSpawn(client, other)
+        return
+    end
+
+    local yaw = minecraftPlayerAngle(other.yaw)
+    local pitch = minecraftPlayerAngle(other.pitch)
+
+    sendPacket(client, 0x4C,
+        P.writeVarInt(other.entityId) ..
+        P.writeDouble(other.mcPos.x) ..
+        P.writeDouble(other.mcPos.y) ..
+        P.writeDouble(other.mcPos.z) ..
+        string.char(yaw) ..
+        string.char(pitch) ..
+        P.writeBool(other.onGround)
+    )
+
+    sendPacket(client, 0x36,
+        P.writeVarInt(other.entityId) ..
+        string.char(yaw)
+    )
+end
+
+local function removeMinecraftPlayerFromViewer(client, other)
+    if not client or not other or client == other then return end
+    if client.state ~= STATE_PLAY then return end
+
+    if client.spawnedMinecraftEntities then
+        client.spawnedMinecraftEntities[other.entityId] = nil
+    end
+    if client.pendingMinecraftSpawns then
+        client.pendingMinecraftSpawns[other.entityId] = nil
+    end
+
+    sendDestroyEntity(client, other.entityId)
+    sendPlayerListRemove(client, P.writeUUIDBytes(other.entityId))
+end
+
+refreshMinecraftPlayerForViewers = function(respawnedClient)
+    if not C.enable_minecraft_player_visibility then return end
+    if not respawnedClient or respawnedClient.state ~= STATE_PLAY then return end
+
+    for _, viewer in pairs(clients) do
+        if viewer.state == STATE_PLAY and viewer ~= respawnedClient then
+            removeMinecraftPlayerFromViewer(viewer, respawnedClient)
+            scheduleMinecraftPlayerSpawn(viewer, respawnedClient)
+        end
+    end
 end
 
 local function nearestGmodPlayer(client, range)
@@ -959,9 +1227,31 @@ local function buildChunkSection(chunkX, chunkZ, sectionY)
     local bitsPerBlock = 4
     local longCount = 256
     local longs = {}
+    local palette = { 0, C.floor_block_state }
+    local paletteLookup = {
+        [0] = 0,
+        [C.floor_block_state] = 1
+    }
 
     for i = 1, longCount do
         longs[i] = { low = 0, high = 0 }
+    end
+
+    local function paletteIndex(state)
+        state = tonumber(state) or 0
+        if state == 0 then return 0 end
+
+        local found = paletteLookup[state]
+        if found then return found end
+
+        if #palette >= 16 then
+            log("chunk palette is full; dropping block state " .. tostring(state))
+            return 0
+        end
+
+        palette[#palette + 1] = state
+        paletteLookup[state] = #palette - 1
+        return #palette - 1
     end
 
     local function addToLong(index, offset, value)
@@ -983,14 +1273,19 @@ local function buildChunkSection(chunkX, chunkZ, sectionY)
                 local state = 0
 
                 if globalY == C.floor_y then
-                    state = samplePlatformBlock(blockX, blockZ) ~= 0 and 1 or 0
+                    state = samplePlatformBlock(blockX, blockZ)
+                end
+
+                local stored = getWorldBlock(blockX, globalY, blockZ)
+                if stored ~= nil then
+                    state = stored
                 end
 
                 local bitIndex = blockIndex * bitsPerBlock
                 local longIndex = math.floor(bitIndex / 64) + 1
                 local bitOffset = bitIndex % 64
 
-                addToLong(longIndex, bitOffset, state)
+                addToLong(longIndex, bitOffset, paletteIndex(state))
             end
         end
     end
@@ -1002,10 +1297,14 @@ local function buildChunkSection(chunkX, chunkZ, sectionY)
 
     local blockLight = string.rep("\255", 2048)
     local skyLight = string.rep("\255", 2048)
+
+    local paletteData = { P.writeVarInt(#palette) }
+    for _, state in ipairs(palette) do
+        paletteData[#paletteData + 1] = P.writeVarInt(state)
+    end
+
     return string.char(bitsPerBlock) ..
-        P.writeVarInt(2) ..
-        P.writeVarInt(0) ..
-        P.writeVarInt(C.floor_block_state) ..
+        table.concat(paletteData) ..
         P.writeVarInt(longCount) ..
         table.concat(packed) ..
         blockLight ..
@@ -1132,7 +1431,7 @@ sendBridgeArenaBlocks = function(client)
     sendSystemChat(client, "Bridge arena synced: " .. sent .. " platform blocks.")
 end
 
-local function minecraftAngle(degrees)
+minecraftAngle = function(degrees)
     return math.floor((degrees % 360) * 256 / 360)
 end
 
@@ -1287,8 +1586,19 @@ end
 
 local function sendMinecraftPlayersToList(client)
     for _, other in pairs(clients) do
-        if other.state == STATE_PLAY then
+        if other.state == STATE_PLAY and other ~= client then
             addMinecraftPlayerToList(client, other)
+        end
+    end
+end
+
+sendMinecraftPlayersToMinecraft = function(client)
+    if not C.enable_minecraft_player_visibility then return end
+    if not client or client.state ~= STATE_PLAY then return end
+
+    for _, other in pairs(clients) do
+        if other.state == STATE_PLAY and other ~= client then
+            scheduleMinecraftPlayerSpawn(client, other)
         end
     end
 end
@@ -1328,12 +1638,13 @@ local function sendJoinGame(client)
     )
 end
 
-local function sendDeferredWorldSync(client)
+sendDeferredWorldSync = function(client)
     if not client or client.dead or client.state ~= STATE_PLAY then return end
 
     log("sending deferred world sync to " .. tostring(client.username or client.entityId))
     sendTabListHeader(client)
     sendMinecraftPlayersToList(client)
+    sendMinecraftPlayersToMinecraft(client)
     sendGmodPlayersToMinecraft(client)
     if C.send_blocks_on_login then
         sendBridgeArenaBlocks(client)
@@ -1477,6 +1788,7 @@ local function handleLogin(client, packet)
     for _, other in pairs(clients) do
         if other.state == STATE_PLAY and other ~= client then
             addMinecraftPlayerToList(other, client)
+            scheduleMinecraftPlayerSpawn(other, client)
         end
     end
     broadcastChat("[MC] " .. username .. " joined the bridge")
@@ -1587,6 +1899,8 @@ local function acceptClients()
             lastKeepalive = CurTime(),
             spawnedGmodEntities = {},
             pendingGmodSpawns = {},
+            spawnedMinecraftEntities = {},
+            pendingMinecraftSpawns = {},
             gmodEquipment = {},
             outBuffer = "",
             mcPos = table.Copy(C.minecraft_spawn)
@@ -1632,7 +1946,7 @@ local function pollClients()
                 PrintMessage(HUD_PRINTTALK, "[MC] " .. client.username .. " disconnected")
                 for _, other in pairs(clients) do
                     if other.state == STATE_PLAY and other ~= client then
-                        sendPlayerListRemove(other, P.writeUUIDBytes(client.entityId))
+                        removeMinecraftPlayerFromViewer(other, client)
                     end
                 end
                 broadcastChat("[MC] " .. client.username .. " left the bridge")
@@ -1644,9 +1958,25 @@ local function pollClients()
     end
 end
 
+local function syncMinecraftPlayers()
+    if not C.enable_minecraft_player_visibility then return end
+
+    for _, client in pairs(clients) do
+        if client.state == STATE_PLAY then
+            for _, other in pairs(clients) do
+                if other.state == STATE_PLAY and other ~= client then
+                    sendMinecraftPlayerTeleport(client, other)
+                end
+            end
+        end
+    end
+end
+
 local function syncGmodPlayers()
     if CurTime() - lastPosSync < C.position_sync_interval then return end
     lastPosSync = CurTime()
+
+    syncMinecraftPlayers()
 
     for _, ply in ipairs(player.GetAll()) do
         if IsValid(ply) then
@@ -1807,11 +2137,17 @@ function MC_GM.Start()
     ensureBasePlatformBlocks()
     rebuildMinecraftBlockEnts()
     createSharedPlatform()
+    for _, ply in ipairs(player.GetAll()) do
+        enablePlayerBlockCollisionRule(ply)
+    end
 
     timer.Create("MCGM_Tick", C.tick_interval, 0, function()
         if not server then return end
         acceptClients()
         pollClients()
+        for _, ply in ipairs(player.GetAll()) do
+            applySoftMinecraftBlockCollision(ply)
+        end
         syncGmodPlayers()
         projectProps()
         syncHitboxBlocks()
@@ -1832,13 +2168,24 @@ function MC_GM.Start()
             end
             return ""
         end
+        if command == "!resetworld" or command == "/resetworld" or command == "!resetblocks" or command == "/resetblocks" then
+            if IsValid(ply) and not ply:IsAdmin() then
+                PrintMessage(HUD_PRINTTALK, "[MCGM] " .. ply:Nick() .. " tried to reset the bridge world but is not an admin")
+                return ""
+            end
+            resetBridgeWorldBlocks()
+            PrintMessage(HUD_PRINTTALK, "[MCGM] " .. ply:Nick() .. " reset the bridge world")
+            return ""
+        end
         broadcastChat("[GMod] <" .. ply:Nick() .. "> " .. text)
     end)
 
     hook.Add("PlayerSpawn", "MCGM_SpawnOnBridge", function(ply)
+        enablePlayerBlockCollisionRule(ply)
         spawnGmodPlayerOnBridge(ply)
         timer.Simple(0.2, function()
             if not IsValid(ply) then return end
+            enablePlayerBlockCollisionRule(ply)
             for _, client in pairs(clients) do
                 if client.state == STATE_PLAY then
                     client.spawnedGmodEntities[ply:EntIndex()] = nil
@@ -1856,7 +2203,9 @@ function MC_GM.Start()
     end)
 
     hook.Add("PlayerInitialSpawn", "MCGM_InitialSpawnOnBridge", function(ply)
+        enablePlayerBlockCollisionRule(ply)
         timer.Simple(1, function()
+            enablePlayerBlockCollisionRule(ply)
             spawnGmodPlayerOnBridge(ply)
         end)
     end)
@@ -1876,6 +2225,11 @@ function MC_GM.Start()
     end)
 
     concommand.Add("mcgm_world_reset", function(ply)
+        if IsValid(ply) and not ply:IsAdmin() then return end
+        resetBridgeWorldBlocks()
+    end)
+
+    concommand.Add("mcgm_resetworld", function(ply)
         if IsValid(ply) and not ply:IsAdmin() then return end
         resetBridgeWorldBlocks()
     end)
@@ -1982,6 +2336,14 @@ function MC_GM.Start()
         end
     end)
 
+    hook.Add("ShouldCollide", "MCGM_BlockPlayerCollision", function(ent1, ent2)
+        if C.minecraft_block_collide_players ~= false then return end
+        if not IsValid(ent1) or not IsValid(ent2) then return end
+
+        if ent1:IsPlayer() and ent2.MCGM_BlockKey then return false end
+        if ent2:IsPlayer() and ent1.MCGM_BlockKey then return false end
+    end)
+
     log("listening for Minecraft " .. C.minecraft_version .. " clients on port " .. C.port)
 end
 
@@ -1994,6 +2356,7 @@ function MC_GM.Stop()
     concommand.Remove("mcgm_spawn_bridge")
     concommand.Remove("mcgm_world_save")
     concommand.Remove("mcgm_world_reset")
+    concommand.Remove("mcgm_resetworld")
     concommand.Remove("mcgm_block_place")
     concommand.Remove("mcgm_block_break")
     concommand.Remove("mcgm_block_test_visible")
@@ -2005,6 +2368,7 @@ function MC_GM.Stop()
     hook.Remove("PhysgunPickup", "MCGM_ProtectBridgePhysgun")
     hook.Remove("GravGunPickupAllowed", "MCGM_ProtectBridgeGravgun")
     hook.Remove("CanTool", "MCGM_ProtectBridgeToolgun")
+    hook.Remove("ShouldCollide", "MCGM_BlockPlayerCollision")
     removeSharedPlatform()
 
     for key, ent in pairs(minecraftBlockEnts) do
