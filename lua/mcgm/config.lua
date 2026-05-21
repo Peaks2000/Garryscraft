@@ -22,6 +22,8 @@ MC_GM.Config = {
     shared_platform_tile_size = 384,
     shared_platform_tiles = 3,
     shared_platform_z = -32,
+    shared_platform_align_top_to_origin = true,
+    shared_platform_surface_z = 0,
     shared_platform_destructible = false,
     force_gmod_spawn_to_bridge = true,
     gmod_spawn_offset = Vector(0, 0, 24),
@@ -54,10 +56,12 @@ MC_GM.Config = {
     minecraft_build_block_state = 16,
     minecraft_block_entity_class = "base_anim",
     minecraft_block_model = "models/hunter/blocks/cube025x025x025.mdl",
+    minecraft_block_material = "models/debug/debugwhite",
+    minecraft_block_color = Color(80, 220, 120, 255),
     minecraft_block_scale = 3,
     minecraft_block_mins = Vector(-16, -16, -16),
     minecraft_block_maxs = Vector(16, 16, 16),
-    minecraft_block_solid = false,
+    minecraft_block_solid = true,
     minecraft_block_collide_players = true,
     minecraft_block_soft_player_collision = true,
     minecraft_block_soft_collision_half_size = 16,
@@ -90,7 +94,27 @@ MC_GM.Config = {
     prop_scan_interval = 2,
     prop_scan_radius = 4096,
     max_prop_blocks_per_scan = 128,
-    prop_block_state = 16
+    prop_block_state = 16,
+
+    -- Minecraft 1.12.2 block states are usually block_id * 16 + metadata.
+    -- Replace model/material values with paths from an installed Minecraft block addon.
+    minecraft_block_types = {
+        [16] = { name = "Stone", item_id = 1, state = 16, color = Color(120, 120, 120, 255) },
+        [32] = { name = "Grass", item_id = 2, state = 32, color = Color(90, 170, 70, 255) },
+        [48] = { name = "Dirt", item_id = 3, state = 48, color = Color(130, 85, 50, 255) },
+        [64] = { name = "Cobblestone", item_id = 4, state = 64, color = Color(105, 105, 105, 255) },
+        [80] = { name = "Oak Planks", item_id = 5, state = 80, color = Color(170, 135, 80, 255) },
+        [320] = { name = "Glass", item_id = 20, state = 320, color = Color(180, 230, 255, 160), material = "models/debug/debugwhite" }
+    },
+
+    minecraft_hotbar_blocks = {
+        [3] = 16,
+        [4] = 32,
+        [5] = 48,
+        [6] = 64,
+        [7] = 80,
+        [8] = 320
+    }
 }
 
 MC_GM.WorldPath = "mcgm/world.json"

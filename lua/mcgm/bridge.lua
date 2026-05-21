@@ -139,7 +139,7 @@ local function minecraftBlockToVec(x, y, z)
 end
 
 local function enablePlayerBlockCollisionRule(ent)
-    if IsValid(ent) and ent.SetCustomCollisionCheck then
+    if C.minecraft_block_collide_players == false and IsValid(ent) and ent.SetCustomCollisionCheck then
         ent:SetCustomCollisionCheck(true)
     end
 end
@@ -151,13 +151,20 @@ local function removeMinecraftBlockEnt(key)
     minecraftBlockEnts[key] = nil
 end
 
+local function getMinecraftBlockType(state)
+    state = tonumber(state) or 0
+    local types = C.minecraft_block_types or {}
+    return types[state] or types[state - (state % 16)] or {}
+end
+
 local function spawnMinecraftBlockEnt(x, y, z, state)
     if not C.enable_minecraft_block_building or state == 0 then return end
 
     local key = blockKey(x, y, z)
     removeMinecraftBlockEnt(key)
 
-    local model = C.minecraft_block_model
+    local blockType = getMinecraftBlockType(state)
+    local model = blockType.model or C.minecraft_block_model
     if util and util.IsValidModel and not util.IsValidModel(model) then
         log("configured minecraft_block_model is invalid: " .. tostring(model) .. "; using hunter cube fallback")
         model = "models/hunter/blocks/cube025x025x025.mdl"
@@ -172,12 +179,13 @@ local function spawnMinecraftBlockEnt(x, y, z, state)
     end
 
     local pos = minecraftBlockToVec(x, y, z)
+    local color = blockType.color or C.minecraft_block_color or Color(80, 220, 120, 255)
     ent:SetModel(model)
     ent:SetPos(pos)
     ent:SetAngles(Angle(0, 0, 0))
-    ent:SetColor(Color(80, 220, 120, 255))
-    ent:SetRenderMode(RENDERMODE_NORMAL)
-    ent:SetMaterial("models/debug/debugwhite")
+    ent:SetColor(color)
+    ent:SetRenderMode(color.a and color.a < 255 and RENDERMODE_TRANSCOLOR or RENDERMODE_NORMAL)
+    ent:SetMaterial(blockType.material or C.minecraft_block_material or "")
     ent.MCGM_BlockKey = key
     ent.MCGM_BlockState = state
     ent:Spawn()
@@ -185,11 +193,11 @@ local function spawnMinecraftBlockEnt(x, y, z, state)
     ent:SetMoveType(MOVETYPE_NONE)
     ent:SetPos(minecraftBlockToVec(x, y, z))
     ent:SetAngles(Angle(0, 0, 0))
-    ent:SetModelScale(C.minecraft_block_scale or 1, 0)
+    ent:SetModelScale(blockType.scale or C.minecraft_block_scale or 1, 0)
     ent:Activate()
     ent:SetNoDraw(false)
     ent:DrawShadow(true)
-    ent:SetSolid(C.minecraft_block_solid and SOLID_BBOX or SOLID_NONE)
+    ent:SetSolid(C.minecraft_block_solid and SOLID_VPHYSICS or SOLID_NONE)
     ent:SetCollisionBounds(C.minecraft_block_mins or Vector(-16, -16, -16), C.minecraft_block_maxs or Vector(16, 16, 16))
     ent:SetCollisionGroup(COLLISION_GROUP_NONE)
     enablePlayerBlockCollisionRule(ent)
@@ -211,7 +219,6 @@ local function applySoftMinecraftBlockCollision(ply)
 
     local plyPos = ply:GetPos()
     local playerHalfWidth = 16
-    local playerHeight = 72
     local blockHalf = C.minecraft_block_soft_collision_half_size or 16
     local expandedHalf = blockHalf + playerHalfWidth
     local margin = 0.5
@@ -221,26 +228,18 @@ local function applySoftMinecraftBlockCollision(ply)
     for _, ent in pairs(minecraftBlockEnts) do
         if IsValid(ent) then
             local blockPos = ent:GetPos()
-            local blockBottom = blockPos.z - blockHalf
             local blockTop = blockPos.z + blockHalf
             local playerBottom = newPos.z
-            local playerTop = newPos.z + playerHeight
+            local footSnapDepth = 10
 
-            if playerTop > blockBottom and playerBottom < blockTop then
+            if playerBottom >= blockPos.z and playerBottom < blockTop and blockTop - playerBottom <= footSnapDepth then
                 local dx = newPos.x - blockPos.x
                 local dy = newPos.y - blockPos.y
                 local absX = math.abs(dx)
                 local absY = math.abs(dy)
 
                 if absX < expandedHalf and absY < expandedHalf then
-                    local pushX = expandedHalf - absX + margin
-                    local pushY = expandedHalf - absY + margin
-
-                    if pushX < pushY then
-                        newPos.x = newPos.x + (dx >= 0 and pushX or -pushX)
-                    else
-                        newPos.y = newPos.y + (dy >= 0 and pushY or -pushY)
-                    end
+                    newPos.z = blockTop + margin
                     moved = true
                 end
             end
@@ -250,7 +249,9 @@ local function applySoftMinecraftBlockCollision(ply)
     if moved then
         ply:SetPos(newPos)
         local velocity = ply:GetVelocity()
-        ply:SetVelocity(Vector(-velocity.x * 0.5, -velocity.y * 0.5, 0))
+        if velocity.z < 0 then
+            ply:SetVelocity(Vector(0, 0, -velocity.z))
+        end
     end
 end
 
@@ -367,6 +368,14 @@ local function sendMinecraftCombatHotbar(client)
     sendSetSlot(client, 36, ITEM_IRON_SWORD, 1, 0)
     sendSetSlot(client, 37, ITEM_BOW, 1, 0)
     sendSetSlot(client, 38, ITEM_ARROW, 64, 0)
+
+    for hotbarSlot, state in pairs(C.minecraft_hotbar_blocks or {}) do
+        local blockType = getMinecraftBlockType(state)
+        local itemId = blockType.item_id or math.floor((tonumber(state) or 0) / 16)
+        if hotbarSlot >= 0 and hotbarSlot <= 8 and itemId > 0 then
+            sendSetSlot(client, 36 + hotbarSlot, itemId, blockType.count or 64, blockType.damage or 0)
+        end
+    end
 end
 
 local function sendMinecraftGameMode(client, mode)
@@ -560,6 +569,12 @@ local function setWorldBlock(x, y, z, state, persist)
     end
 
     broadcastBlockChange(x, y, z, state)
+end
+
+local function selectedMinecraftBuildState(client)
+    local slot = client and client.selectedHotbarSlot
+    local state = slot and (C.minecraft_hotbar_blocks or {})[slot]
+    return tonumber(state) or C.minecraft_build_block_state
 end
 
 local function rayAabbTrace(startPos, dir, minPos, maxPos, maxDist)
@@ -1163,10 +1178,19 @@ local function createSharedPlatform()
                 ent:SetPos(C.gmod_origin + Vector(x * tileSize, y * tileSize, C.shared_platform_z or 0))
                 ent:SetAngles(Angle(0, 0, 0))
                 ent:Spawn()
+                if C.shared_platform_align_top_to_origin then
+                    local surfaceZ = C.gmod_origin.z + (C.shared_platform_surface_z or 0)
+                    ent:SetPos(Vector(
+                        C.gmod_origin.x + x * tileSize,
+                        C.gmod_origin.y + y * tileSize,
+                        surfaceZ - ent:OBBMaxs().z
+                    ))
+                end
                 ent:SetSolid(SOLID_VPHYSICS)
                 ent:SetCollisionGroup(COLLISION_GROUP_NONE)
                 local phys = ent:GetPhysicsObject()
                 if IsValid(phys) then
+                    phys:SetPos(ent:GetPos())
                     phys:EnableMotion(false)
                 end
                 sharedPlatform[#sharedPlatform + 1] = ent
@@ -1745,11 +1769,12 @@ local function handleBlockPlacement(client, packet)
     local y = pos.y + dy
     local z = pos.z + dz
 
-    setWorldBlock(x, y, z, C.minecraft_build_block_state, true)
+    local state = selectedMinecraftBuildState(client)
+    setWorldBlock(x, y, z, state, true)
     if C.debug_block_packets then
         log((client.username or "MC") .. " place face=" .. tostring(face) .. " base=" .. pos.x .. "," .. pos.y .. "," .. pos.z)
     end
-    log((client.username or "MC") .. " placed bridge block at " .. x .. "," .. y .. "," .. z)
+    log((client.username or "MC") .. " placed bridge block state=" .. tostring(state) .. " at " .. x .. "," .. y .. "," .. z)
 end
 
 local function handleHandshake(client, packet)
