@@ -688,7 +688,7 @@ local function gmodPlaceBridgeBlock(ply)
     setWorldBlock(x, y, z, C.minecraft_build_block_state, true)
     resendSpawnChunksToMinecraft()
     broadcastBlockChange(x, y, z, C.minecraft_build_block_state)
-    log((IsValid(ply) and ply:Nick() or "Console") .. " placed bridge block at " .. x .. "," .. y .. "," .. z)
+    log((IsValid(ply) and ply:Nick() or "Console") .. " placed block at " .. x .. "," .. y .. "," .. z)
     return true
 end
 
@@ -711,7 +711,7 @@ local function gmodBreakBridgeBlock(ply)
 
     setWorldBlock(x, y, z, 0, true)
     broadcastBlockChange(x, y, z, 0)
-    log((IsValid(ply) and ply:Nick() or "Console") .. " broke bridge block at " .. x .. "," .. y .. "," .. z)
+    log((IsValid(ply) and ply:Nick() or "Console") .. " broke block at " .. x .. "," .. y .. "," .. z)
     return true
 end
 
