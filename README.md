@@ -100,9 +100,4 @@ Important settings:
 - `force_gmod_spawn_to_bridge`: move GMod players to the shared arena on spawn.
 - `hitbox_sync_interval`: how often GMod prop/platform hitboxes are sent to MC.
 
-## Notes
 
-This is a first working scaffold, not a production-quality protocol
-implementation. Minecraft clients expect chunks, dimensions, entity metadata,
-and keepalives to be exactly right across versions. The next big milestone is
-proper entity metadata, and collision-aware movement.
